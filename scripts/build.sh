@@ -45,6 +45,11 @@ echo "==> Signing (ad-hoc)"
 # --timestamp=none: without it a re-signed binary whose embedded signature
 # carries a timestamp newer than the clock (fresh CI checkout, clock skew)
 # makes codesign fail with "timestamps differ by N seconds".
+# The dylib ships in the repo with an ad-hoc signature from the machine that
+# built it. Re-signing it on another machine fails with "timestamps differ by
+# N seconds" (the embedded signature is newer than the runner's clock), so drop
+# the old signature first.
+codesign --remove-signature "${APP}/Contents/Frameworks/libonnxruntime.dylib" 2>/dev/null || true
 codesign --force --sign - --timestamp=none "${APP}/Contents/Frameworks/libonnxruntime.dylib"
 codesign --force --sign - --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
     --options runtime "${APP}/Contents/MacOS/soundlab-cli"
