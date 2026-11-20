@@ -57,9 +57,7 @@ final class Updater: ObservableObject {
         if !silent { status = "Проверяю обновления…" }
         errorText = nil
 
-        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repository)/releases/latest")!)
-        request.setValue("MacSoundLab", forHTTPHeaderField: "User-Agent")
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let request = Self.releaseRequest()
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
@@ -101,9 +99,7 @@ final class Updater: ObservableObject {
         errorText = nil
         status = "Скачиваю \(version)…"
 
-        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repository)/releases/latest")!)
-        request.setValue("MacSoundLab", forHTTPHeaderField: "User-Agent")
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let request = Self.releaseRequest()
 
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let self, let data,
@@ -219,6 +215,20 @@ final class Updater: ObservableObject {
             let message = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             throw UpdaterError.toolFailed(executable, message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+    }
+
+    // MARK: - networking
+
+    /// GitHub serves the release list with `Cache-Control: max-age=60`; without
+    /// bypassing the cache a release published a minute ago looks like "no
+    /// update" and the app keeps saying it is current.
+    private static func releaseRequest() -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repository)/releases/latest")!,
+                                 cachePolicy: .reloadIgnoringLocalCacheData,
+                                 timeoutInterval: 20)
+        request.setValue("MacSoundLab", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        return request
     }
 
     // MARK: - versions

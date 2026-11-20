@@ -233,8 +233,15 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
     auto create_session = [&](bool try_accel) -> bool {
         if (d->opts) { d->api->ReleaseSessionOptions(d->opts); d->opts = nullptr; }
         d->api->CreateSessionOptions(&d->opts);
-        d->api->SetIntraOpNumThreads(d->opts, 2);
+        // One thread: the model needs ~0.6 ms of a 2.67 ms block, and every
+        // extra ORT thread spins between hops and keeps a core busy for nothing.
+        // Spinning is off for the same reason - the wake-up cost is smaller
+        // than the idle burn at this block rate.
+        d->api->SetIntraOpNumThreads(d->opts, 1);
         d->api->SetInterOpNumThreads(d->opts, 1);
+        d->api->AddSessionConfigEntry(d->opts, "session.intra_op.allow_spinning", "0");
+        d->api->AddSessionConfigEntry(d->opts, "session.inter_op.allow_spinning", "0");
+        d->api->AddSessionConfigEntry(d->opts, "session.use_spinning", "0");
         if (try_accel) {
 #ifdef __ANDROID__
             using AccelFn = OrtStatus* (*)(OrtSessionOptions*, uint32_t);
