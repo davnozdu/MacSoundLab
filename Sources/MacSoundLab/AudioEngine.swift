@@ -130,6 +130,7 @@ final class AudioEngine: ObservableObject {
     @Published private(set) var deviceKind: OutputKind = .headphones
     @Published private(set) var sourceIsSurround = false
     @Published private(set) var neuralReady = false
+    private var lastReverbLog: Bool?
     @Published private(set) var accelActive = false
     @Published private(set) var modelMs: Float = 0
     @Published private(set) var modelDrops: UInt64 = 0
@@ -255,7 +256,12 @@ final class AudioEngine: ObservableObject {
     func setReverb(_ on: Bool) {
         if let renderer {
             sl_set_reverb(renderer, on ? 1 : 0)
-            NSLog("MacSoundLab: reverb=\(on ? 1 : 0)")
+            // Only on a real change: apply() sets the same values on start and
+            // used to print this four times in a row.
+            if lastReverbLog != on {
+                lastReverbLog = on
+                NSLog("MacSoundLab: reverb=\(on ? 1 : 0)")
+            }
         }
     }
 

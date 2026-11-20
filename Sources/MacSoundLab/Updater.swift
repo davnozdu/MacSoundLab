@@ -180,15 +180,22 @@ final class Updater: ObservableObject {
         APP="\(target.path)"
         NEW="\(replacement.path)"
         OLD="$APP.old"
+        # Never touch the installed app unless the replacement is a real,
+        # signed bundle: a truncated zip would otherwise be copied over a
+        # working install and ditto can still exit 0 on garbage.
+        [ -f "$NEW/Contents/Info.plist" ] || exit 2
+        [ -x "$NEW/Contents/MacOS/\(Bundle.main.executableURL?.lastPathComponent ?? "MacSoundLab")" ] || exit 2
+        /usr/bin/codesign --verify --deep --strict "$NEW" >/dev/null 2>&1 || exit 2
         rm -rf "$OLD"
         mv "$APP" "$OLD" || exit 1
-        if /usr/bin/ditto "$NEW" "$APP"; then
+        if /usr/bin/ditto "$NEW" "$APP" && /usr/bin/codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
             rm -rf "$OLD"
             /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null
             /usr/bin/open "$APP"
         else
             rm -rf "$APP"
             mv "$OLD" "$APP"
+            /usr/bin/open "$APP"
         fi
         """
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
