@@ -42,10 +42,13 @@ cp assets/AppIcon.icns "${APP}/Contents/Resources/"
 cp core/third_party/libonnxruntime.dylib "${APP}/Contents/Frameworks/"
 
 echo "==> Signing (ad-hoc)"
-codesign --force --sign - "${APP}/Contents/Frameworks/libonnxruntime.dylib"
-codesign --force --sign - --entitlements scripts/MacSoundLab.entitlements \
+# --timestamp=none: without it a re-signed binary whose embedded signature
+# carries a timestamp newer than the clock (fresh CI checkout, clock skew)
+# makes codesign fail with "timestamps differ by N seconds".
+codesign --force --sign - --timestamp=none "${APP}/Contents/Frameworks/libonnxruntime.dylib"
+codesign --force --sign - --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
     --options runtime "${APP}/Contents/MacOS/soundlab-cli"
-codesign --force --sign - --entitlements scripts/MacSoundLab.entitlements \
+codesign --force --sign - --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
     --options runtime "${APP}"
 
 echo "==> Done: ${APP}"
