@@ -206,7 +206,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             if settings.profile == .speech {
-                Text("В профиле «Подкаст» комната отключена всегда: голос должен быть сухим.")
+                Text("«Подкаст» держит голос по центру, но стерео источника не схлопывает.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }

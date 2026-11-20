@@ -41,9 +41,11 @@ ProfileParams get_profile_params(Profile p) {
         case Profile::Music:
             return {1.0f, 0.08f, 0.25f, false, 0.38f, 0.32f};
         case Profile::Speech:
-            // Podcast / audiobook: no room at all, dialogue lifted, stereo narrowed so
-            // the voice stays centred and the compressor does the loudness work.
-            return {1.32f, 0.0f, 0.0f, true, 0.16f, 0.08f};
+            // Podcast / audiobook: dialogue lifted and compressed, but the stereo
+            // image of the source is kept - a YouTube talk still has music and
+            // effects at the sides, and collapsing them to mono is not "cleaner",
+            // it is just flat. The room follows the user's switch.
+            return {1.20f, 0.10f, 0.22f, true, 0.45f, 0.30f};
         case Profile::Game:
         default:
             return {1.0f, 0.10f, 0.22f, false, 0.45f, 0.40f};
@@ -634,6 +636,17 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     const float* fr = &block_[1 * kHop];
     has_lfe = false;
 
+    // Whether the source carries a stereo image is decided on the input, not on
+    // the separated signal: a vocal model can centre the voice hard, and a
+    // speech profile must not mistake that for a mono podcast.
+    double source_difference = 0.0;
+    double source_magnitude = 0.0;
+    for (int i = 0; i < kHop; ++i) {
+        source_difference += std::fabs(fl[i] - fr[i]);
+        source_magnitude += std::fabs(fl[i]) + std::fabs(fr[i]);
+    }
+    const bool source_is_mono = source_difference < 0.02 * source_magnitude + 1e-9;
+
     std::array<float, 2 * kHop> amb{};
     std::array<float, 2 * kHop> rear{};
 
@@ -647,7 +660,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
         for (int i = 0; i < 2 * kHop; ++i) {
             const float voice = dry[i] - sep_rest[i];
-            block_[i] = voice * 1.18f + sep_rest[i] * 0.45f;
+            block_[i] = voice * 1.15f + sep_rest[i] * 0.70f;
         }
     }
     if (neural_ && profile_ == Profile::Movie &&
@@ -703,14 +716,8 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     // Podcasts, YouTube talks and audiobooks are usually mono: there is nothing
     // to place, so the voice goes dead centre and the ambience spread is
     // skipped instead of inventing a stereo image from nothing.
-    if (profile_ == Profile::Speech) {
-        double difference = 0.0;
-        double magnitude = 0.0;
-        for (int i = 0; i < kHop; ++i) {
-            difference += std::fabs(fl[i] - fr[i]);
-            magnitude += std::fabs(fl[i]) + std::fabs(fr[i]);
-        }
-        if (difference < 0.02 * magnitude + 1e-9) {
+    if (profile_ == Profile::Speech && source_is_mono) {
+        {
             for (int i = 0; i < kHop; ++i) {
                 const float mid = 0.5f * (fl[i] + fr[i]);
                 feeds_[0 * kHop + i] = 0.0f;
@@ -870,6 +877,36 @@ void Renderer::process_hop() {
     if (profile_ == Profile::Off) {
         std::memcpy(out_fifo_[0].data(), &block_[0 * kHop], kHop * sizeof(float));
         std::memcpy(out_fifo_[1].data(), &block_[1 * kHop], kHop * sizeof(float));
+        out_read_pos_ = 0;
+        out_avail_ = kHop;
+        return;
+    }
+
+    // Silence gate. The process tap keeps delivering zeroed buffers when no app
+    // is playing, and running the separator plus seven HRTF convolutions on that
+    // costs about a third of a core for nothing. The hangover is long enough for
+    // the room tail to decay before the renderer goes quiet, so there is no cut.
+    constexpr int kSilenceHangoverHops = 220;  // ~0.6 s at 48 kHz
+    float block_peak = 0.0f;
+    for (int c = 0; c < 2; ++c) {
+        for (int i = 0; i < kHop; ++i) {
+            const float v = std::fabs(block_[c * kHop + i]);
+            if (v > block_peak) block_peak = v;
+        }
+    }
+    if (block_peak < kSilence) {
+        if (silent_hops_ < kSilenceHangoverHops) ++silent_hops_;
+    } else if (silent_hops_ >= kSilenceHangoverHops) {
+        // Coming back from a long gap: drop stale filter and model state so the
+        // first block after silence does not carry the tail of the old one.
+        reset();
+        silent_hops_ = 0;
+    } else {
+        silent_hops_ = 0;
+    }
+    if (silent_hops_ >= kSilenceHangoverHops) {
+        std::fill(out_fifo_[0].begin(), out_fifo_[0].end(), 0.0f);
+        std::fill(out_fifo_[1].begin(), out_fifo_[1].end(), 0.0f);
         out_read_pos_ = 0;
         out_avail_ = kHop;
         return;

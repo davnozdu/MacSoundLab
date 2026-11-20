@@ -192,6 +192,9 @@ private:
     DeviceKind device_ = DeviceKind::Headphones;
     bool reverb_ = true;
     bool bypass_ = false;
+    // Hops of digital silence seen so far; once it passes the hangover the
+    // renderer short-circuits instead of running the separator on nothing.
+    int silent_hops_ = 0;
     bool neural_ = false;
     uint64_t tick_ = 0;
 
