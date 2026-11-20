@@ -1,0 +1,7 @@
+.build/
+build/
+models/
+core/third_party/
+.venv-tools/
+*.zip
+.DS_Store
