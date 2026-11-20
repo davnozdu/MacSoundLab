@@ -37,18 +37,18 @@ struct ProfileParams {
 ProfileParams get_profile_params(Profile p) {
     switch (p) {
         case Profile::Movie:
-            return {1.2589254f, 0.16f, 0.40f, true, 0.48f, 0.42f};
+            return {1.2589254f, 0.26f, 0.40f, true, 0.48f, 0.42f};
         case Profile::Music:
-            return {1.0f, 0.08f, 0.25f, false, 0.38f, 0.32f};
+            return {1.0f, 0.28f, 0.25f, false, 0.38f, 0.32f};
         case Profile::Speech:
             // Podcast / audiobook: dialogue lifted and compressed, but the stereo
             // image of the source is kept - a YouTube talk still has music and
             // effects at the sides, and collapsing them to mono is not "cleaner",
             // it is just flat. The room follows the user's switch.
-            return {1.20f, 0.10f, 0.22f, true, 0.45f, 0.30f};
+            return {1.20f, 0.26f, 0.22f, true, 0.45f, 0.30f};
         case Profile::Game:
         default:
-            return {1.0f, 0.10f, 0.22f, false, 0.45f, 0.40f};
+            return {1.0f, 0.30f, 0.22f, false, 0.45f, 0.40f};
     }
 }
 
@@ -582,6 +582,11 @@ void Renderer::set_profile(Profile p) {
             break;
         case Profile::Music:
             room_.set_responses(room_len, room_music_.data());
+            break;
+        case Profile::Speech:
+            // Speech borrows the short game room: a podcast should sound like a
+            // small room, not a hall, but it must be audible when switched on.
+            room_.set_responses(room_len, room_game_.data());
             break;
         case Profile::Game:
         default:

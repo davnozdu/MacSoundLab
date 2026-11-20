@@ -253,7 +253,10 @@ final class AudioEngine: ObservableObject {
     }
 
     func setReverb(_ on: Bool) {
-        if let renderer { sl_set_reverb(renderer, on ? 1 : 0) }
+        if let renderer {
+            sl_set_reverb(renderer, on ? 1 : 0)
+            NSLog("MacSoundLab: reverb=\(on ? 1 : 0)")
+        }
     }
 
     func setBypass(_ on: Bool) {
