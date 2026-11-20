@@ -84,7 +84,8 @@ private:
     bool diagonal_ = false;
     RealFFT fft_{2 * kHop};
     std::vector<std::complex<float>> spectra_;  // [parts, sources, ears, bins]
-    std::vector<std::complex<float>> history_;  // [parts, sources, bins]
+    std::vector<std::complex<float>> history_;  // ring: [parts, sources, bins]
+    int hist_pos_ = 0;                          // newest frame slot
     std::vector<float> previous_;               // [sources, kHop]
     std::vector<std::complex<float>> accum_;    // [ears, bins]
     std::vector<float> frame_buf_;              // [2 * kHop]
