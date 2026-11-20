@@ -11,8 +11,9 @@ permissions:
 
 jobs:
   app:
-    # Apple Silicon runner: the app is arm64-only.
-    runs-on: macos-14-arm64
+    # Intel runner by default: Apple Silicon runners are often queued for a
+    # long time on public repositories. scripts/build.sh cross-builds arm64.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 

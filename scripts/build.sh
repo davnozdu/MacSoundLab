@@ -22,8 +22,15 @@ if [ ! -f core/third_party/libonnxruntime.dylib ] || [ ! -f core/third_party/inc
 fi
 
 echo "==> Building (arm64)"
-swift build -c release --product MacSoundLab --arch arm64
-swift build -c release --product soundlab-cli --arch arm64
+# On Apple Silicon this is a plain build; on an Intel CI runner it is a
+# cross-build into arm64, which the same Xcode SDK supports.
+if [ "$(uname -m)" = "arm64" ]; then
+    TARGET=(--arch arm64)
+else
+    TARGET=(--triple arm64-apple-macosx14.2)
+fi
+swift build -c release --product MacSoundLab "${TARGET[@]}"
+swift build -c release --product soundlab-cli "${TARGET[@]}"
 
 echo "==> Bundling"
 rm -rf "${APP}"

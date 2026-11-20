@@ -84,6 +84,7 @@ final class Updater: ObservableObject {
                     self.status = self.updateAvailable
                         ? "Доступна версия \(self.latestVersion ?? "")"
                         : "Установлена последняя версия"
+                    NSLog("MacSoundLab: update current=\(self.currentVersion) latest=\(self.latestVersion ?? "-") available=\(self.updateAvailable)")
                 } catch {
                     if !silent { self.errorText = "Не разобрал ответ GitHub: \(error.localizedDescription)" }
                     self.status = nil
@@ -129,6 +130,7 @@ final class Updater: ObservableObject {
     }
 
     private func handleDownload(location: URL?, error: Error?, version: String) {
+        NSLog("MacSoundLab: update download finished for \(version), error=\(error?.localizedDescription ?? "-")")
         guard let location, error == nil else {
             isInstalling = false
             errorText = "Скачивание не удалось: \(error?.localizedDescription ?? "неизвестная ошибка")"
@@ -160,6 +162,7 @@ final class Updater: ObservableObject {
             let target = Bundle.main.bundleURL
             status = "Устанавливаю…"
             try scheduleSwap(target: target, replacement: app)
+            NSLog("MacSoundLab: update swap scheduled, replacing \(target.path)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 NSApp.terminate(nil)
             }
