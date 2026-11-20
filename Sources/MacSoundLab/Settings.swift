@@ -38,6 +38,7 @@ final class SettingsStore: ObservableObject {
     @Published var neural: Bool { didSet { save() } }
     @Published var reverb: Bool { didSet { save() } }
     @Published var bypass: Bool { didSet { save() } }
+    @Published var autoUpdate: Bool { didSet { save() } }
     @Published var deviceUID: String? { didSet { save() } }
     @Published var kindOverrides: [String: Int] { didSet { save() } }
     @Published var launchAtLogin: Bool { didSet { save(); applyLoginItem() } }
@@ -48,6 +49,7 @@ final class SettingsStore: ObservableObject {
         neural = defaults.object(forKey: "neural") as? Bool ?? true
         reverb = defaults.object(forKey: "reverb") as? Bool ?? true
         bypass = defaults.bool(forKey: "bypass")
+        autoUpdate = defaults.bool(forKey: "autoUpdate")
         deviceUID = defaults.string(forKey: "deviceUID")
         kindOverrides = defaults.dictionary(forKey: "kindOverrides") as? [String: Int] ?? [:]
         launchAtLogin = defaults.bool(forKey: "launchAtLogin")
@@ -59,6 +61,7 @@ final class SettingsStore: ObservableObject {
         defaults.set(neural, forKey: "neural")
         defaults.set(reverb, forKey: "reverb")
         defaults.set(bypass, forKey: "bypass")
+        defaults.set(autoUpdate, forKey: "autoUpdate")
         if let deviceUID { defaults.set(deviceUID, forKey: "deviceUID") } else { defaults.removeObject(forKey: "deviceUID") }
         defaults.set(kindOverrides, forKey: "kindOverrides")
         defaults.set(launchAtLogin, forKey: "launchAtLogin")
@@ -82,6 +85,7 @@ final class AppModel: ObservableObject {
     let engine = AudioEngine()
     let settings = SettingsStore()
     let models = ModelStore()
+    let updater = Updater()
 
     @Published private(set) var devices: [AudioOutput] = []
     @Published var errorText: String?
@@ -104,6 +108,11 @@ final class AppModel: ObservableObject {
         settings.$kindOverrides.sink { [weak self] _ in self?.apply() }.store(in: &bag)
 
         engine.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &bag)
+        updater.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &bag)
+        updater.$latestVersion.sink { [weak self] version in
+            guard let self, version != nil, self.settings.autoUpdate, self.updater.updateAvailable else { return }
+            self.updater.install()
+        }.store(in: &bag)
 
         watchDefaultDevice()
         deviceTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -112,6 +121,9 @@ final class AppModel: ObservableObject {
 
         if settings.enabled {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.apply() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.updater.check(silent: true)
         }
     }
 

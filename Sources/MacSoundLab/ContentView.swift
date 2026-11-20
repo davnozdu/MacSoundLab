@@ -65,6 +65,10 @@ struct MenuBarContent: View {
         Toggle("Сравнить с оригиналом", isOn: $settings.bypass)
             .disabled(!settings.enabled)
         Divider()
+        if let version = model.updater.latestVersion, model.updater.updateAvailable {
+            Button("Обновить до \(version)") { model.updater.install() }
+            Divider()
+        }
         if model.engine.isRunning {
             Text("Выход: \(model.currentOutputName)")
             Text("Задержка: \(Int(model.engine.estimatedLatencyMs)) мс")
@@ -95,6 +99,7 @@ struct ContentView: View {
                 switches
                 statistics
                 modelSection
+                updatesSection
                 if let message = model.engine.errorMessage ?? model.errorText ?? model.models.errorText {
                     banner(message)
                 }
@@ -296,6 +301,50 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var updatesSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Версия").font(.headline)
+            HStack(spacing: 8) {
+                Text("Установлена \(model.updater.currentVersion)")
+                    .font(.callout)
+                Spacer()
+                if model.updater.isInstalling {
+                    ProgressView().controlSize(.small)
+                } else if model.updater.isChecking {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Проверить обновления") { model.updater.check() }
+                        .controlSize(.small)
+                }
+            }
+            if model.updater.updateAvailable, let version = model.updater.latestVersion {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.accentColor)
+                    Text("Вышла версия \(version)")
+                        .font(.callout)
+                    Spacer()
+                    Button("Обновить") { model.updater.install() }
+                        .controlSize(.small)
+                        .disabled(model.updater.isInstalling)
+                }
+            }
+            if let status = model.updater.status {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+            if let error = model.updater.errorText {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+            Toggle("Обновляться автоматически", isOn: $settings.autoUpdate)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+            Text("Обновления берутся из GitHub Releases: приложение скачивает архив, "
+                 + "проверяет подпись бандла и перезапускается.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
