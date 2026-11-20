@@ -58,6 +58,13 @@ struct MenuBarContent: View {
             .disabled(!settings.enabled)
         }
         Divider()
+        Toggle("Нейросеть", isOn: $settings.neural)
+            .disabled(!settings.enabled || !model.models.modelInstalled)
+        Toggle("Реверберация (комната)", isOn: $settings.reverb)
+            .disabled(!settings.enabled)
+        Toggle("Сравнить с оригиналом", isOn: $settings.bypass)
+            .disabled(!settings.enabled)
+        Divider()
         if model.engine.isRunning {
             Text("Выход: \(model.currentOutputName)")
             Text("Задержка: \(Int(model.engine.estimatedLatencyMs)) мс")
@@ -184,8 +191,20 @@ struct ContentView: View {
             Text("Обработка").font(.headline)
             Toggle("Нейросеть для стерео (StemgenRT)", isOn: $settings.neural)
                 .disabled(!settings.enabled || !model.models.modelInstalled)
-            Toggle("Синтетическая комната", isOn: $settings.reverb)
-                .disabled(!settings.enabled)
+            VStack(alignment: .leading, spacing: 2) {
+                Toggle("Реверберация (комната)", isOn: $settings.reverb)
+                    .disabled(!settings.enabled)
+                Text(settings.reverb
+                     ? "Включена: добавлен синтетический хвост комнаты — объём и «воздух»."
+                     : "Выключена: сухой звук без комнаты, только прямые HRTF-отражения.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if settings.profile == .speech {
+                Text("В профиле «Подкаст» комната отключена всегда: голос должен быть сухим.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
             Toggle("Сравнить с оригиналом", isOn: $settings.bypass)
                 .disabled(!settings.enabled)
         }
