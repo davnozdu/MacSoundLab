@@ -98,6 +98,12 @@ struct EngineStats {
     var ringFillMs: Double = 0
     var levelLeft: Float = 0
     var levelRight: Float = 0
+    var outputFrames: UInt64 = 0
+    var outputPeak: Float = 0
+    var inFrames: UInt64 = 0
+    var callbacks: Int = 0
+    var lastFrames: Int = 0
+    var silentReturns: Int = 0
 }
 
 enum EngineError: LocalizedError {
@@ -131,6 +137,11 @@ final class AudioEngine: ObservableObject {
     @Published private(set) var sourceIsSurround = false
     @Published private(set) var neuralReady = false
     private var lastReverbLog: Bool?
+    private var dumpInHandle: FileHandle?
+    private var dumpOutHandle: FileHandle?
+    private var dumpFrames = 0
+    private let muteOutput = ProcessInfo.processInfo.environment["SL_MUTE"] != nil
+    private var lastPublishAt = CACurrentMediaTime()
     @Published private(set) var accelActive = false
     @Published private(set) var modelMs: Float = 0
     @Published private(set) var modelDrops: UInt64 = 0
@@ -161,6 +172,7 @@ final class AudioEngine: ObservableObject {
     /// Device rate / tap rate, plus the slow drift correction.
     private var baseStep: Double = 1.0
     private var primed = false
+    private var resumeFade = 0
     private let targetFillFrames: Double = 1024   // ~21 ms of headroom
 
     // MARK: - lifecycle
@@ -271,7 +283,27 @@ final class AudioEngine: ObservableObject {
 
     // MARK: - tap
 
+    private func startDumpsIfRequested() {
+        let env = ProcessInfo.processInfo.environment
+        func open(_ key: String) -> FileHandle? {
+            guard let path = env[key] else { return nil }
+            FileManager.default.createFile(atPath: path, contents: nil)
+            return FileHandle(forWritingAtPath: path)
+        }
+        dumpInHandle = open("SL_DUMP_INPUT")
+        dumpOutHandle = open("SL_DUMP_OUTPUT")
+        if dumpInHandle != nil || dumpOutHandle != nil {
+            NSLog("MacSoundLab: dumping audio to %@ / %@", env["SL_DUMP_INPUT"] ?? "-", env["SL_DUMP_OUTPUT"] ?? "-")
+        }
+    }
+
+    private func dump(_ handle: FileHandle?, _ base: UnsafePointer<Float>, frames: Int) {
+        guard let handle, dumpFrames < 6 * 48000 else { return }
+        handle.write(Data(bytes: base, count: frames * 2 * MemoryLayout<Float>.size))
+    }
+
     private func startTap() throws {
+        startDumpsIfRequested()
         let ownProcess = AudioDevices.ownProcessObject()
         let excluded: [AudioObjectID] = ownProcess.map { [$0] } ?? []
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
@@ -288,6 +320,22 @@ final class AudioEngine: ObservableObject {
         }
         tapID = tap
         NSLog("MacSoundLab: tap created id=%u", tap)
+
+        // Read the description back: the mute we asked for is not necessarily
+        // the mute we got, and that is the difference between "processed audio
+        // replaces the original" and "processed audio plays on top of it".
+        var descAddress = AudioDevices.propertyAddress(kAudioTapPropertyDescription)
+        var returned: CATapDescription?
+        var descSize = UInt32(MemoryLayout<CATapDescription?>.size)
+        let readStatus = withUnsafeMutablePointer(to: &returned) { pointer in
+            AudioObjectGetPropertyData(tap, &descAddress, 0, nil, &descSize, pointer)
+        }
+        if readStatus == noErr, let returned {
+            NSLog("MacSoundLab: tap mute behavior = %d (asked for %d), name=\(returned.name ?? "-")",
+                  returned.muteBehavior.rawValue, CATapMuteBehavior.muted.rawValue)
+        } else {
+            NSLog("MacSoundLab: tap description read failed: %d", readStatus)
+        }
 
         var address = AudioDevices.propertyAddress(kAudioTapPropertyUID)
         guard let tapUID = AudioDevices.readString(tap, address) else {
@@ -350,6 +398,12 @@ final class AudioEngine: ObservableObject {
 
         let frames = list.map { Int($0.mDataByteSize) / (max(1, Int($0.mNumberChannels)) * 4) }.max() ?? 0
         guard frames > 0 else { return }
+        statsLock.lock()
+        stats.inFrames += UInt64(frames)
+        statsLock.unlock()
+
+
+
         if logTicks == 0 && !loggedFirstBlock {
             loggedFirstBlock = true
             NSLog("MacSoundLab: first tap block %d frames, %d buffers, %u ch",
@@ -384,6 +438,7 @@ final class AudioEngine: ObservableObject {
                     base[2 * i + 1] = mono[i]
                 }
             }
+            dump(dumpInHandle, base, frames: frames)
         }
 
         let started = DispatchTime.now().uptimeNanoseconds
@@ -391,6 +446,10 @@ final class AudioEngine: ObservableObject {
             inBuffer.withUnsafeBufferPointer { source in
                 guard let inBase = source.baseAddress, let outBase = destination.baseAddress else { return }
                 sl_process(renderer, inBase, outBase, Int32(frames), 2)
+                if muteOutput {
+                    for i in 0..<frames * 2 { outBase[i] = 0 }
+                }
+                dump(dumpOutHandle, outBase, frames: frames)
                 ring.write(outBase, frames: frames)
             }
         }
@@ -463,7 +522,9 @@ final class AudioEngine: ObservableObject {
             AudioObjectSetPropertyData(device.id, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &wanted)
         }
 
-        guard AudioOutputUnitStart(unit) == noErr else {
+        let startStatus = AudioOutputUnitStart(unit)
+        NSLog("MacSoundLab: output device=%u \"\(device.name)\" uid=\(device.uid) rate=\(outputRate) start=\(startStatus)")
+        guard startStatus == noErr else {
             AudioUnitUninitialize(unit)
             ComponentDispose(unit)
             throw EngineError.noOutputUnit
@@ -490,6 +551,9 @@ final class AudioEngine: ObservableObject {
                 primed = true
             } else {
                 silence(list, frames: frames)
+                statsLock.lock()
+                stats.silentReturns += 1
+                statsLock.unlock()
                 return noErr
             }
         }
@@ -506,11 +570,21 @@ final class AudioEngine: ObservableObject {
             for i in 0..<frames * 2 { base[i] = 0 }
             produced = ring.read(into: base, frames: frames, step: step)
             if produced == 0 {
-                // Starved: re-prime instead of trickling the next burst through.
-                primed = false
+                // Starved. Re-priming here used to cost a full 21 ms of silence,
+                // which is exactly the click the ear hears as a dropout; keep the
+                // stream alive and fade back in when the ring recovers.
+                resumeFade = 480
                 statsLock.lock()
                 stats.underruns += 1
                 statsLock.unlock()
+            } else if resumeFade > 0 {
+                let ramp = min(resumeFade, produced)
+                for i in 0..<ramp {
+                    let gain = Float(resumeFade - i) / Float(resumeFade)
+                    base[2 * i] *= gain
+                    base[2 * i + 1] *= gain
+                }
+                resumeFade -= ramp
             }
         }
 
@@ -522,6 +596,12 @@ final class AudioEngine: ObservableObject {
                 peakLeft = max(peakLeft, abs(base[2 * i]))
                 peakRight = max(peakRight, abs(base[2 * i + 1]))
             }
+            statsLock.lock()
+            stats.outputFrames += UInt64(frames)
+            stats.outputPeak = max(stats.outputPeak, max(peakLeft, peakRight))
+            stats.callbacks += 1
+            stats.lastFrames = frames
+            statsLock.unlock()
             write(list, from: base, frames: frames)
         }
 
@@ -572,6 +652,9 @@ final class AudioEngine: ObservableObject {
 
     private func publishStats() {
         guard let renderer else { return }
+        let now = CACurrentMediaTime()
+        let elapsed = max(1e-6, now - lastPublishAt)
+        lastPublishAt = now
         var modelMs: Float = 0
         var drops: UInt64 = 0
         sl_stats(renderer, &modelMs, &drops)
@@ -584,6 +667,19 @@ final class AudioEngine: ObservableObject {
         let fill = stats.ringFillMs
         let left = stats.levelLeft
         let right = stats.levelRight
+        let outFrames = stats.outputFrames
+        let outPeak = stats.outputPeak
+        let cbs = stats.callbacks
+        let lastFr = stats.lastFrames
+        let silent = stats.silentReturns
+        let inFr = stats.inFrames
+        let underruns = stats.underruns
+        stats.inFrames = 0
+        let consumed = blockCount
+        stats.outputFrames = 0
+        stats.outputPeak = 0
+        stats.callbacks = 0
+        stats.silentReturns = 0
         statsLock.unlock()
 
         self.modelMs = modelMs
@@ -598,8 +694,9 @@ final class AudioEngine: ObservableObject {
 
         logTicks += 1
         if logTicks % 8 == 0 {
-            NSLog("MacSoundLab: live fill=%.0fms dsp=%.2fms peak=%.3f/%.3f model=%.2fms",
-                  fill, dspMs, left, right, modelMs)
+            NSLog("MacSoundLab: live fill=%.0fms dsp=%.2fms peak=%.3f/%.3f model=%.2fms drops=%llu in=%.0f/s out=%.0f/s underruns=%d",
+                  fill, dspMs, left, right, modelMs, drops, Double(inFr) / elapsed,
+                  Double(outFrames) / elapsed, underruns)
         }
     }
 

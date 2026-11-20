@@ -185,6 +185,9 @@ public:
 
 private:
     float sample_rate_ = 48000.0f;
+    // 0 = full stereo routing, 1 = mono source routed to the centre; smoothed so
+    // a podcast that hovers around the mono threshold does not flip the routing.
+    float mono_weight_ = 0.0f;
     std::string runtime_dir_;
     std::string vocals_model_;
     std::string speech_model_;
@@ -205,6 +208,14 @@ private:
     BiquadFilter cinema_air_;
     BiquadFilter speech_hp_;
     BiquadFilter speech_presence_;
+    BiquadFilter speech_tame_;
+    BiquadFilter speech_lift_lp_;
+    // Built-in laptop speakers: the side channel dies in the acoustic crosstalk
+    // of two drivers 20 cm apart, so the speakers path spends its budget on the
+    // centre (voice) and on presence instead of on width.
+    BiquadFilter glasses_air_;
+    BiquadFilter small_hp_;
+    BiquadFilter small_presence_;
 
     Convolver direct_;
     Convolver room_;

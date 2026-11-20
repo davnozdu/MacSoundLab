@@ -561,9 +561,17 @@ void Renderer::init(float sample_rate) {
     glasses_bass_.configure_lowpass_2nd(220.0f, sample_rate, 2);
     cinema_air_.configure_highpass_2nd(4500.0f, sample_rate, 2);
     // Speech chain: rumble out of the way, presence lifted so consonants cut through
-    // on a phone speaker, nothing added on top.
+    // on a phone speaker, and the top closed at 11 kHz - a podcast carries nothing
+    // above that except codec noise, which is what the shelf would amplify into hiss.
     speech_hp_.configure_highpass_2nd(95.0f, sample_rate, 2);
-    speech_presence_.configure_high_shelf(2800.0f, 4.5f, sample_rate, 2);
+    speech_presence_.configure_high_shelf(2800.0f, 2.8f, sample_rate, 2);
+    speech_tame_.configure_lowpass_2nd(11000.0f, sample_rate, 2);
+    speech_lift_lp_.configure_lowpass_2nd(3000.0f, sample_rate, 2);
+    // Small drivers waste their excursion below ~70 Hz and bury consonants in
+    // 200-500 Hz; a rumble cut plus a presence shelf is what is actually audible.
+    glasses_air_.configure_high_shelf(4000.0f, 2.5f, sample_rate, 2);
+    small_hp_.configure_highpass_2nd(75.0f, sample_rate, 2);
+    small_presence_.configure_high_shelf(2200.0f, 4.5f, sample_rate, 2);
     widener_.init(sample_rate);
     dynamics_.init(sample_rate);
 
@@ -673,18 +681,12 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     std::array<float, 2 * kHop> rear{};
 
 #ifdef ALLY_ENABLE_NPU
-    if (neural_ && profile_ == Profile::Speech &&
-        vocals_.ensure_loaded(speech_model_.c_str(), true, ort_library_path())) {
-        // Speech model: keep the voice, tuck everything else away. No room, no air -
-        // the stereo path below only has to place it.
-        std::array<float, 2 * kHop> dry{};
-        std::array<float, 2 * kHop> sep_rest{};
-        vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
-        for (int i = 0; i < 2 * kHop; ++i) {
-            const float voice = dry[i] - sep_rest[i];
-            block_[i] = voice * 1.15f + sep_rest[i] * 0.70f;
-        }
-    }
+    // Speech keeps its own audio path: the model's copy of the signal is not
+    // transparent (measured 10 dB below the signal overall, and as loud as the
+    // signal above 4 kHz, where speech itself has almost nothing). On a podcast
+    // that layer is audible as a crackle, and the separation buys only 1.7 dB of
+    // presence - which the static EQ already provides, cleanly. So the model is
+    // not used in this profile; the voice lift is done with a shelf instead.
     if (neural_ && profile_ == Profile::Movie &&
         vocals_.ensure_loaded(vocals_model_.c_str(), true, ort_library_path())) {
         std::array<float, 2 * kHop> dry{};
@@ -735,30 +737,34 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         amb[1 * kHop + i] = rest_r - 0.7f * rest_l;
     }
 
-    // Podcasts, YouTube talks and audiobooks are usually mono: there is nothing
-    // to place, so the voice goes dead centre and the ambience spread is
-    // skipped instead of inventing a stereo image from nothing.
-    if (profile_ == Profile::Speech && source_is_mono) {
-        {
-            for (int i = 0; i < kHop; ++i) {
-                const float mid = 0.5f * (fl[i] + fr[i]);
-                feeds_[0 * kHop + i] = 0.0f;
-                feeds_[1 * kHop + i] = 0.0f;
-                feeds_[2 * kHop + i] = mid * cfg.dialogue;
-                feeds_[3 * kHop + i] = 0.0f;
-                feeds_[4 * kHop + i] = 0.0f;
-                feeds_[5 * kHop + i] = 0.0f;
-                feeds_[6 * kHop + i] = 0.0f;
-            }
-            return;
-        }
-    }
     ambience_delay_.process(amb.data(), rear.data(), kHop);
     for (int i = 0; i < kHop; ++i) {
         feeds_[3 * kHop + i] = rear[0 * kHop + i] * cfg.rear_gain;
         feeds_[4 * kHop + i] = rear[1 * kHop + i] * cfg.rear_gain;
         feeds_[5 * kHop + i] = amb[0 * kHop + i] * cfg.side_gain;
         feeds_[6 * kHop + i] = amb[1 * kHop + i] * cfg.side_gain;
+    }
+
+    // Podcasts, YouTube talks and audiobooks are usually mono: there is nothing
+    // to place, so the voice goes dead centre and the ambience spread is skipped
+    // instead of inventing a stereo image from nothing. The decision is smoothed
+    // over ~250 ms: a real podcast hovers around the threshold and a per-block
+    // switch flipped the routing 83 times a second (median run 2 blocks, 5 ms),
+    // and every flip cut the HRTF and the delay lines - heard as crackle.
+    if (profile_ == Profile::Speech) {
+        const float target = source_is_mono ? 1.0f : 0.0f;
+        const float coeff = 1.0f - std::exp(-static_cast<float>(kHop) / (0.25f * sample_rate_));
+        mono_weight_ += (target - mono_weight_) * coeff;
+        if (mono_weight_ > 0.001f) {
+            for (int i = 0; i < kHop; ++i) {
+                const float mid = 0.5f * (fl[i] + fr[i]) * cfg.dialogue;
+                const float keep = 1.0f - mono_weight_;
+                for (int ch = 0; ch < 7; ++ch) {
+                    feeds_[ch * kHop + i] *= keep;
+                }
+                feeds_[2 * kHop + i] += mid * mono_weight_;
+            }
+        }
     }
 }
 
@@ -794,9 +800,13 @@ void Renderer::apply_speech_eq(float* out_l, float* out_r) {
     std::array<float, kHop> tmp{};
     speech_hp_.process(out_l, tmp.data(), 0, kHop);
     speech_presence_.process(tmp.data(), out_l, 0, kHop);
+    speech_tame_.process(out_l, tmp.data(), 0, kHop);
+    std::copy(tmp.begin(), tmp.end(), out_l);
     std::fill(tmp.begin(), tmp.end(), 0.0f);
     speech_hp_.process(out_r, tmp.data(), 1, kHop);
     speech_presence_.process(tmp.data(), out_r, 1, kHop);
+    speech_tame_.process(out_r, tmp.data(), 1, kHop);
+    std::copy(tmp.begin(), tmp.end(), out_r);
 }
 
 void Renderer::render_headphones(bool has_lfe, float* out_l, float* out_r) {
@@ -827,12 +837,25 @@ void Renderer::render_headphones(bool has_lfe, float* out_l, float* out_r) {
         out_r[i] = ears_[kHop + i] * 0.85f;
     }
     if (device_ == DeviceKind::Glasses) {
-        std::array<float, kHop> bass_l{}, bass_r{};
-        glasses_bass_.process(out_l, bass_l.data(), 0, kHop);
-        glasses_bass_.process(out_r, bass_r.data(), 1, kHop);
-        for (int i = 0; i < kHop; ++i) {
-            out_l[i] += bass_l[i] * kGlassesBassGain;
-            out_r[i] += bass_r[i] * kGlassesBassGain;
+        // Music, film and games want the lift: it is what makes the glasses sound
+        // bigger than they are. Speech does not - a podcast is already compressed
+        // and loud, and the lift is exactly what cracked on it. So the lift stays
+        // for everything except Speech, and the air shelf stays for everything.
+        if (profile_ != Profile::Speech) {
+            std::array<float, kHop> bass_l{}, bass_r{};
+            glasses_bass_.process(out_l, bass_l.data(), 0, kHop);
+            glasses_bass_.process(out_r, bass_r.data(), 1, kHop);
+            for (int i = 0; i < kHop; ++i) {
+                out_l[i] += bass_l[i] * kGlassesBassGain;
+                out_r[i] += bass_r[i] * kGlassesBassGain;
+            }
+        }
+        if (profile_ != Profile::Speech) {
+            std::array<float, kHop> air_l{}, air_r{};
+            glasses_air_.process(out_l, air_l.data(), 0, kHop);
+            glasses_air_.process(out_r, air_r.data(), 1, kHop);
+            std::copy(air_l.begin(), air_l.end(), out_l);
+            std::copy(air_r.begin(), air_r.end(), out_r);
         }
     }
     apply_speech_eq(out_l, out_r);
@@ -848,15 +871,21 @@ void Renderer::render_speakers(bool has_lfe, float* out_l, float* out_r) {
     }
     speaker_delay_.process(s_mid.data(), late.data(), kHop);
     for (int i = 0; i < kHop; ++i) {
-        float voice = 0.707f * feeds_[2 * kHop + i];
+        // Small speakers cannot reproduce the side image, so the centre is worth
+        // more than the width: voice up, side down, room untouched.
+        float voice = 0.98f * feeds_[2 * kHop + i];
         float sl = feeds_[5 * kHop + i] + 0.8f * feeds_[3 * kHop + i];
         float sr = feeds_[6 * kHop + i] + 0.8f * feeds_[4 * kHop + i];
-        float s_side = 0.75f * (sl - sr);
+        float s_side = 0.32f * (sl - sr);
         float lt = late[i] * 0.6f;
         out_l[i] = feeds_[0 * kHop + i] + voice + lt + s_side;
         out_r[i] = feeds_[1 * kHop + i] + voice + lt - s_side;
     }
-    widener_.process(out_l, out_r);
+    // The crosstalk widener only makes sense when the drivers are far apart and
+    // aimed at the listener; on a laptop it just costs mono compatibility.
+    if (is_surround_) {
+        widener_.process(out_l, out_r);
+    }
     if (reverb_) {
         for (int i = 0; i < kHop; ++i) {
             room_send_[i] = out_l[i] * 0.5f;
@@ -879,6 +908,13 @@ void Renderer::render_speakers(bool has_lfe, float* out_l, float* out_r) {
         }
     }
     apply_speech_eq(out_l, out_r);
+
+    // Small-speaker tuning, after the mix so it also shapes the room and the LFE.
+    std::array<float, kHop> hp_l{}, hp_r{};
+    small_hp_.process(out_l, hp_l.data(), 0, kHop);
+    small_hp_.process(out_r, hp_r.data(), 1, kHop);
+    small_presence_.process(hp_l.data(), out_l, 0, kHop);
+    small_presence_.process(hp_r.data(), out_r, 1, kHop);
 }
 
 void Renderer::downmix(float* out_l, float* out_r) {
