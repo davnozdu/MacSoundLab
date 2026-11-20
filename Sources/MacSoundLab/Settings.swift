@@ -109,10 +109,16 @@ final class AppModel: ObservableObject {
 
         engine.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &bag)
         updater.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &bag)
-        updater.$latestVersion.sink { [weak self] version in
-            guard let self, version != nil, self.settings.autoUpdate, self.updater.updateAvailable else { return }
-            self.updater.install()
-        }.store(in: &bag)
+        // @Published fires on willSet, so reading updateAvailable right here
+        // still sees the previous (nil) version and the auto-install never ran.
+        // Hopping to the next main-queue turn lets the property land first.
+        updater.$latestVersion
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] version in
+                guard let self, version != nil, self.settings.autoUpdate, self.updater.updateAvailable else { return }
+                self.updater.install()
+            }
+            .store(in: &bag)
 
         watchDefaultDevice()
         deviceTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
