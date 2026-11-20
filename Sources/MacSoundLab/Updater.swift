@@ -94,6 +94,7 @@ final class Updater: ObservableObject {
     // MARK: - install
 
     func install() {
+        NSLog("MacSoundLab: update install requested (latest=\(latestVersion ?? "-") available=\(updateAvailable) busy=\(isInstalling))")
         guard !isInstalling, let version = latestVersion, updateAvailable else { return }
         isInstalling = true
         errorText = nil
@@ -104,12 +105,14 @@ final class Updater: ObservableObject {
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let self, let data,
                   let release = try? JSONDecoder().decode(Release.self, from: data) else {
+                NSLog("MacSoundLab: update metadata fetch failed")
                 DispatchQueue.main.async {
                     self?.isInstalling = false
                     self?.errorText = "Не удалось получить список файлов релиза."
                 }
                 return
             }
+            NSLog("MacSoundLab: update assets=\(release.assets.map(\.name).joined(separator: ","))")
             guard let asset = release.assets.first(where: { $0.name.lowercased().hasSuffix(".zip") }) else {
                 DispatchQueue.main.async {
                     self.isInstalling = false
@@ -117,6 +120,7 @@ final class Updater: ObservableObject {
                 }
                 return
             }
+            NSLog("MacSoundLab: update downloading \(asset.name) (\(asset.size) bytes)")
             URLSession.shared.downloadTask(with: asset.browserDownloadURL) { location, _, error in
                 DispatchQueue.main.async {
                     self.handleDownload(location: location, error: error, version: version)
