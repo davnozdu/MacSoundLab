@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 
 /// Updates from GitHub Releases: check the latest tag, download the zip, verify
 /// what is inside, swap the bundle and relaunch. No Sparkle, no appcast key —
@@ -158,6 +159,16 @@ final class Updater: ObservableObject {
             guard bundledVersion == version else {
                 throw UpdaterError.versionMismatch(bundledVersion ?? "nil", version)
             }
+            // A stably signed build only accepts an update signed by the same
+            // certificate. An ad-hoc build (requirement is a bare cdhash) cannot
+            // tell signers apart and only checks that the signature is intact.
+            if let requirement = Self.ownDesignatedRequirement(), !requirement.contains("cdhash") {
+                do {
+                    try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R", "=" + requirement, app.path])
+                } catch {
+                    throw UpdaterError.wrongSigner
+                }
+            }
 
             let target = Bundle.main.bundleURL
             status = "Устанавливаю…"
@@ -214,6 +225,21 @@ final class Updater: ObservableObject {
         try process.run()
     }
 
+    /// Designated requirement of the running app, e.g.
+    /// identifier "cz.davnozdu.macsoundlab" and certificate root = H"...".
+    static func ownDesignatedRequirement() -> String? {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
+        var requirement: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess,
+              let requirement else { return nil }
+        var text: CFString?
+        guard SecRequirementCopyString(requirement, [], &text) == errSecSuccess, let text else { return nil }
+        return text as String
+    }
+
     private func run(_ executable: String, _ arguments: [String]) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -265,6 +291,7 @@ enum UpdaterError: LocalizedError {
     case wrongBundle(String)
     case versionMismatch(String, String)
     case toolFailed(String, String)
+    case wrongSigner
 
     var errorDescription: String? {
         switch self {
@@ -276,6 +303,8 @@ enum UpdaterError: LocalizedError {
             return "В архиве версия \(found), ждали \(expected)."
         case .toolFailed(let tool, let message):
             return "\(tool) завершился с ошибкой: \(message)"
+        case .wrongSigner:
+            return "Обновление подписано другим сертификатом — установка отменена."
         }
     }
 }

@@ -43,20 +43,50 @@ cp assets/AppIcon.icns "${APP}/Contents/Resources/"
 cp assets/models/vocals_int8.onnx assets/models/LICENSE-StemgenRT.md "${APP}/Contents/Resources/"
 cp core/third_party/libonnxruntime.dylib "${APP}/Contents/Frameworks/"
 
-echo "==> Signing (ad-hoc)"
-# --timestamp=none: without it a re-signed binary whose embedded signature
-# carries a timestamp newer than the clock (fresh CI checkout, clock skew)
-# makes codesign fail with "timestamps differ by N seconds".
-# The dylib ships in the repo with an ad-hoc signature from the machine that
-# built it. Re-signing it on another machine fails with "timestamps differ by
-# N seconds" (the embedded signature is newer than the runner's clock), so drop
-# the old signature first.
+# Signing. A stable certificate keeps the designated requirement the same
+# across builds ("identifier ... and certificate root = H..."), so macOS keeps
+# the "System Audio Recording" permission after an update, and the updater can
+# refuse a bundle signed by anyone else. Ad-hoc signing (a new cdhash every
+# build) is only the fallback for builds without the certificate.
+#   local: ~/.config/macsoundlab-signing/{signing.keychain-db,signing.env}
+#   CI:    SIGN_KEYCHAIN / SIGN_KEYCHAIN_PASSWORD set by the workflow
+LOCAL_SIGNING="${HOME}/.config/macsoundlab-signing"
+SIGN_KEYCHAIN="${SIGN_KEYCHAIN:-}"
+if [ -z "${SIGN_KEYCHAIN}" ] && [ -f "${LOCAL_SIGNING}/signing.env" ]; then
+    # shellcheck disable=SC1091
+    . "${LOCAL_SIGNING}/signing.env"
+    SIGN_KEYCHAIN="${LOCAL_SIGNING}/signing.keychain-db"
+fi
+SIGN_ARGS=(--sign -)
+if [ -n "${SIGN_KEYCHAIN}" ] && [ -f "${SIGN_KEYCHAIN}" ]; then
+    security unlock-keychain -p "${SIGN_KEYCHAIN_PASSWORD}" "${SIGN_KEYCHAIN}"
+    SIGN_IDENTITY="$(security find-identity -p codesigning "${SIGN_KEYCHAIN}" \
+        | awk '/"Mac Sound Lab Signing"/ { print $2; exit }')"
+    if [ -n "${SIGN_IDENTITY}" ]; then
+        SIGN_ARGS=(--sign "${SIGN_IDENTITY}" --keychain "${SIGN_KEYCHAIN}")
+    fi
+fi
+if [ "${SIGN_ARGS[1]}" = "-" ]; then
+    if [ "${REQUIRE_STABLE_SIGNATURE:-0}" = "1" ]; then
+        echo "error: no signing certificate, refusing to build a release ad-hoc" >&2
+        exit 1
+    fi
+    echo "==> Signing (ad-hoc: no certificate, permissions will reset on update)"
+else
+    echo "==> Signing (Mac Sound Lab Signing, ${SIGN_IDENTITY})"
+fi
+
+# --timestamp=none: a timestamp newer than the clock (fresh CI checkout, clock
+# skew) makes codesign fail with "timestamps differ by N seconds". The dylib
+# ships with a signature from the machine that built it; drop it first.
 codesign --remove-signature "${APP}/Contents/Frameworks/libonnxruntime.dylib" 2>/dev/null || true
-codesign --force --sign - --timestamp=none "${APP}/Contents/Frameworks/libonnxruntime.dylib"
-codesign --force --sign - --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
+codesign --force "${SIGN_ARGS[@]}" --timestamp=none "${APP}/Contents/Frameworks/libonnxruntime.dylib"
+codesign --force "${SIGN_ARGS[@]}" --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
     --options runtime "${APP}/Contents/MacOS/soundlab-cli"
-codesign --force --sign - --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
+codesign --force "${SIGN_ARGS[@]}" --timestamp=none --entitlements scripts/MacSoundLab.entitlements \
     --options runtime "${APP}"
+codesign --verify --deep --strict "${APP}"
+codesign -d -r- "${APP}" 2>&1 | sed -n 's/^#* *designated => /    designated: /p'
 
 echo "==> Done: ${APP}"
 echo "    open ${APP}"
