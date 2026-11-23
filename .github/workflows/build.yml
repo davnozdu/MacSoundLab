@@ -40,6 +40,9 @@ jobs:
           security import "$RUNNER_TEMP/signing.p12" -k "$KC" -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" > /dev/null
           rm -f "$RUNNER_TEMP/signing.p12"
+          # codesign resolves the private key through the user search list,
+          # not only through --keychain.
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           echo "SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
           echo "SIGN_KEYCHAIN_PASSWORD=$KCPW" >> "$GITHUB_ENV"
 
