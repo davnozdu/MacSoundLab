@@ -39,6 +39,8 @@ cp .build/release/MacSoundLab "${APP}/Contents/MacOS/"
 cp .build/release/soundlab-cli "${APP}/Contents/MacOS/"
 cp scripts/Info.plist "${APP}/Contents/Info.plist"
 cp assets/AppIcon.icns "${APP}/Contents/Resources/"
+# int8 StemgenRT (tools/quantize_model.py): 3 MB, so it ships instead of being downloaded.
+cp assets/models/vocals_int8.onnx assets/models/LICENSE-StemgenRT.md "${APP}/Contents/Resources/"
 cp core/third_party/libonnxruntime.dylib "${APP}/Contents/Frameworks/"
 
 echo "==> Signing (ad-hoc)"

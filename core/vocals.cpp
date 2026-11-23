@@ -273,6 +273,9 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
         return fail();
     }
     if (!d->ok(d->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "AllySound", &d->env))) return fail();
+    // ONNX Runtime keeps a telemetry store under ~/Library/Application Support/
+    // Microsoft; an audio effect has no business reporting anything.
+    d->ok(d->api->DisableTelemetryEvents(d->env));
 
     auto create_session = [&](bool try_accel) -> bool {
         if (d->opts) { d->api->ReleaseSessionOptions(d->opts); d->opts = nullptr; }

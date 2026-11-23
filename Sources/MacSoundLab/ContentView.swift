@@ -240,7 +240,8 @@ struct ContentView: View {
                 Circle()
                     .fill(model.models.modelInstalled ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
-                Text(model.models.modelInstalled ? "Модель StemgenRT на месте" : "Модель StemgenRT не скачана")
+                Text(model.models.modelIsBundled ? "Модель StemgenRT (int8) встроена"
+                     : model.models.modelInstalled ? "Модель StemgenRT на месте" : "Модель StemgenRT не скачана")
                     .font(.callout)
                 Spacer()
                 if !model.models.modelInstalled {

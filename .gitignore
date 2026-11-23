@@ -1,6 +1,6 @@
 .build/
 build/
-models/
+/models/
 core/third_party/
 .venv-tools/
 *.zip

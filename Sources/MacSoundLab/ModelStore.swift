@@ -1,8 +1,9 @@
 import Foundation
 import CryptoKit
 
-/// Owns the app's support folder: the ONNX Runtime library that ships inside the
-/// bundle, and the vocal-separator model downloaded on first use.
+/// Owns the app's support folder and finds the separator model: the int8 model
+/// that ships inside the bundle (3 MB, built by tools/quantize_model.py), or,
+/// in a build without it, the fp32 model downloaded on first use.
 final class ModelStore: ObservableObject {
     static let modelURL = URL(string: "https://media.githubusercontent.com/media/sweetspotsoundsystem/stemgen-rt/main/model/parallel/vocals.onnx")!
     static let modelSHA256 = "f29a3d8fa596ce4672dd4dc77ccf224f2538389940264aad46ab8168311c2148"
@@ -20,9 +21,24 @@ final class ModelStore: ObservableObject {
         supportDirectory = base.appendingPathComponent("Mac Sound Lab", isDirectory: true)
         modelsDirectory = supportDirectory.appendingPathComponent("models", isDirectory: true)
         try? FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
+        // The bundled int8 model replaces the 11 MB download of older versions.
+        if bundledModelPath != nil, FileManager.default.fileExists(atPath: downloadedModelPath) {
+            try? FileManager.default.removeItem(atPath: downloadedModelPath)
+        }
     }
 
-    var vocalsModelPath: String { modelsDirectory.appendingPathComponent("vocals.onnx").path }
+    /// int8 model inside the app bundle; next to the sources when run from a build tree.
+    var bundledModelPath: String? {
+        if let path = Bundle.main.path(forResource: "vocals_int8", ofType: "onnx") { return path }
+        let tree = FileManager.default.currentDirectoryPath + "/assets/models/vocals_int8.onnx"
+        return FileManager.default.fileExists(atPath: tree) ? tree : nil
+    }
+
+    var modelIsBundled: Bool { bundledModelPath != nil }
+
+    private var downloadedModelPath: String { modelsDirectory.appendingPathComponent("vocals.onnx").path }
+
+    var vocalsModelPath: String { bundledModelPath ?? downloadedModelPath }
 
     var modelInstalled: Bool { FileManager.default.fileExists(atPath: vocalsModelPath) }
 
@@ -65,7 +81,7 @@ final class ModelStore: ObservableObject {
                     throw NSError(domain: "MacSoundLab", code: 2,
                                   userInfo: [NSLocalizedDescriptionKey: "Контрольная сумма модели не совпала."])
                 }
-                let target = URL(fileURLWithPath: vocalsModelPath)
+                let target = URL(fileURLWithPath: downloadedModelPath)
                 try? FileManager.default.removeItem(at: target)
                 try FileManager.default.moveItem(at: temporary, to: target)
                 progress = 1
