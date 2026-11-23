@@ -153,7 +153,12 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Выход").font(.headline)
             Picker("", selection: Binding(
-                get: { settings.deviceUID ?? "" },
+                get: {
+                    if let uid = settings.deviceUID, model.devices.contains(where: { $0.uid == uid }) {
+                        return uid
+                    }
+                    return ""
+                },
                 set: { settings.deviceUID = $0.isEmpty ? nil : $0 }
             )) {
                 Text("Системный по умолчанию").tag("")
@@ -218,60 +223,7 @@ struct ContentView: View {
     }
 
     private var statistics: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Состояние").font(.headline)
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
-                GridRow {
-                    Text("Источник").foregroundStyle(.secondary)
-                    Text(model.engine.sourceIsSurround ? "5.1 / 7.1" : "стерео")
-                }
-                GridRow {
-                    Text("Задержка").foregroundStyle(.secondary)
-                    Text(model.engine.isRunning ? "\(Int(model.engine.estimatedLatencyMs)) мс" : "—")
-                }
-                GridRow {
-                    Text("DSP на блок").foregroundStyle(.secondary)
-                    Text(model.engine.isRunning ? String(format: "%.2f мс", model.engine.dspMs) : "—")
-                }
-                GridRow {
-                    Text("Нейросеть").foregroundStyle(.secondary)
-                    Text(neuralLine)
-                }
-                GridRow {
-                    Text("Приоритет").foregroundStyle(.secondary)
-                    Text(model.engine.neuralReady && model.engine.accelActive ? "GPU / Neural Engine" : "CPU")
-                }
-            }
-            .font(.callout)
-            meters
-        }
-    }
-
-    private var neuralLine: String {
-        if !settings.neural { return "выключена" }
-        if !model.models.modelInstalled { return "модель не скачана" }
-        if !model.engine.neuralReady { return "—" }
-        return String(format: "%.2f мс/блок, сбоев %llu", model.engine.modelMs, model.engine.modelDrops)
-    }
-
-    private var meters: some View {
-        HStack(spacing: 10) {
-            meter(model.engine.levelLeft)
-            meter(model.engine.levelRight)
-        }
-        .frame(height: 8)
-        .padding(.top, 4)
-    }
-
-    private func meter(_ level: Float) -> some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.18))
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(level > 0.98 ? Color.red : Color.accentColor)
-                    .frame(width: geometry.size.width * CGFloat(min(1, level)))
-            }
-        }
+        StatisticsView(meters: model.engine.meters)
     }
 
     private var modelSection: some View {
@@ -371,13 +323,71 @@ struct ContentView: View {
     }
 }
 
+/// The only view that redraws on meter ticks: it observes EngineMeters, which
+/// publishes a value only when the shown number changes.
+struct StatisticsView: View {
+    @EnvironmentObject var model: AppModel
+    @EnvironmentObject var settings: SettingsStore
+    @ObservedObject var meters: EngineMeters
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Состояние").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                GridRow {
+                    Text("Источник").foregroundStyle(.secondary)
+                    Text(meters.sourceIsSurround ? "5.1 / 7.1" : "стерео")
+                }
+                GridRow {
+                    Text("Задержка").foregroundStyle(.secondary)
+                    Text(model.engine.isRunning ? "\(meters.latencyMs) мс" : "—")
+                }
+                GridRow {
+                    Text("DSP на блок").foregroundStyle(.secondary)
+                    Text(model.engine.isRunning ? String(format: "%.2f мс", meters.dspMs) : "—")
+                }
+                GridRow {
+                    Text("Нейросеть").foregroundStyle(.secondary)
+                    Text(neuralLine)
+                }
+                GridRow {
+                    Text("Приоритет").foregroundStyle(.secondary)
+                    Text(meters.neuralReady && meters.accelActive ? "GPU / Neural Engine" : "CPU")
+                }
+            }
+            .font(.callout)
+            HStack(spacing: 10) {
+                meter(meters.levelLeft)
+                meter(meters.levelRight)
+            }
+            .frame(height: 8)
+            .padding(.top, 4)
+        }
+    }
+
+    private var neuralLine: String {
+        if !settings.neural { return "выключена" }
+        if !model.models.modelInstalled { return "модель не скачана" }
+        if settings.profile != .movie { return "только в «Кино»" }
+        if !meters.neuralReady { return "загружается…" }
+        return String(format: "%.2f мс/блок, сбоев %llu", meters.modelMs, meters.modelDrops)
+    }
+
+    private func meter(_ level: Float) -> some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.18))
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(level > 0.98 ? Color.red : Color.accentColor)
+                    .frame(width: geometry.size.width * CGFloat(min(1, level)))
+            }
+        }
+    }
+}
+
 extension AppModel {
     /// UID of the device the "type" override applies to.
     var deviceUIDSnapshot: String {
-        if let uid = settings.deviceUID, !uid.isEmpty { return uid }
-        if let id = AudioDevices.defaultOutput(), let match = devices.first(where: { $0.id == id }) {
-            return match.uid
-        }
-        return ""
+        currentDevice()?.uid ?? ""
     }
 }

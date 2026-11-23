@@ -5,6 +5,7 @@
 #include "vocals.hpp"
 #endif
 #include <array>
+#include <atomic>
 #include <complex>
 #include <cstdint>
 #include <string>
@@ -70,9 +71,15 @@ private:
 class Convolver {
 public:
     Convolver() = default;
-    // responses: [sources * ears * length]
+    // responses: [sources * ears * length]. Becomes response set 0.
     void init(int sources, int ears, int length, const float* responses, bool diagonal = false);
-    void set_responses(int length, const float* responses);
+    // Precomputes another response set (same geometry) and returns its index.
+    // Call before audio starts: it allocates and runs the FFT.
+    int add_response_set(int length, const float* responses);
+    // Switching is a pointer swap: no FFT, no allocation, safe per block.
+    void select_set(int index) {
+        if (index >= 0 && index < static_cast<int>(sets_.size())) active_ = index;
+    }
     void reset();
     // in: [sources * kHop], out: [ears * kHop] (added or overwritten)
     void process(const float* in, float* out);
@@ -82,8 +89,10 @@ private:
     int ears_ = 0;
     int parts_ = 0;
     bool diagonal_ = false;
+    int length_ = 0;
+    int active_ = 0;
     RealFFT fft_{2 * kHop};
-    std::vector<std::complex<float>> spectra_;  // [parts, sources, ears, bins]
+    std::vector<std::vector<std::complex<float>>> sets_;  // each [parts, sources, ears, bins]
     std::vector<std::complex<float>> history_;  // ring: [parts, sources, bins]
     int hist_pos_ = 0;                          // newest frame slot
     std::vector<float> previous_;               // [sources, kHop]
@@ -143,27 +152,33 @@ public:
     void init(float sample_rate);
     void reset();
 
+    // Setters are safe to call from any thread while audio runs: they only
+    // store a request, and the audio thread picks it up at the next hop.
     void set_profile(Profile p);
-    void set_device(DeviceKind d);
-    void set_neural(bool enabled) { neural_ = enabled; }
-    void set_reverb(bool enabled) { reverb_ = enabled; }
-    void set_bypass(bool bypass) { bypass_ = bypass; }
+    void set_device(DeviceKind d) { req_device_.store(d, std::memory_order_relaxed); }
+    void set_neural(bool enabled);
+    void set_reverb(bool enabled) { req_reverb_.store(enabled, std::memory_order_relaxed); }
+    void set_bypass(bool bypass) { req_bypass_.store(bypass, std::memory_order_relaxed); }
 
     // Where the ONNX Runtime library and the separator models live. The host
-    // app owns these paths; the DSP never guesses them.
-    void set_runtime_dir(const char* dir) { runtime_dir_ = dir ? dir : ""; }
-    void set_model_paths(const char* vocals, const char* speech) {
-        vocals_model_ = vocals ? vocals : "";
-        speech_model_ = speech && *speech ? speech : vocals_model_;
-    }
-    bool source_is_surround() const { return is_surround_; }
+    // app owns these paths; the DSP never guesses them. Call from the control
+    // thread, not from the audio thread.
+    void set_runtime_dir(const char* dir);
+    void set_model_paths(const char* vocals, const char* speech);
+    // Blocks until the separator is loaded (or failed). For offline use: the
+    // live path loads it on a background thread and runs passive until ready.
+    bool prepare_neural();
+    // Frames between input and output inside the renderer: the hop FIFO, plus
+    // the separator pipeline while it is actually in use (Movie + neural).
+    int latency_frames() const;
+    bool source_is_surround() const { return surround_flag_.load(std::memory_order_relaxed); }
     // Average neural inference time per hop and fallback count since last call.
     void stats(float* model_ms, uint64_t* drops);
 
-    Profile profile() const { return profile_; }
-    DeviceKind device() const { return device_; }
-    bool neural() const { return neural_; }
-    bool reverb() const { return reverb_; }
+    Profile profile() const { return req_profile_.load(std::memory_order_relaxed); }
+    DeviceKind device() const { return req_device_.load(std::memory_order_relaxed); }
+    bool neural() const { return req_neural_.load(std::memory_order_relaxed); }
+    bool reverb() const { return req_reverb_.load(std::memory_order_relaxed); }
     bool npu_active() const {
 #ifdef ALLY_ENABLE_NPU
         return vocals_.using_npu();
@@ -191,11 +206,25 @@ private:
     std::string runtime_dir_;
     std::string vocals_model_;
     std::string speech_model_;
-    mutable std::string ort_library_;
+    std::string ort_library_;
+
+    // Requested by the control thread.
+    std::atomic<Profile> req_profile_{Profile::Game};
+    std::atomic<DeviceKind> req_device_{DeviceKind::Headphones};
+    std::atomic<bool> req_neural_{false};
+    std::atomic<bool> req_reverb_{true};
+    std::atomic<bool> req_bypass_{false};
+    std::atomic<bool> surround_flag_{false};
+
+    // Snapshot taken by the audio thread at the start of every hop, so one
+    // block never mixes two settings. Only the audio thread touches these.
     Profile profile_ = Profile::Game;
     DeviceKind device_ = DeviceKind::Headphones;
     bool reverb_ = true;
     bool bypass_ = false;
+    int room_set_game_ = 0;
+    int room_set_movie_ = 0;
+    int room_set_music_ = 0;
     // Hops of digital silence seen so far; once it passes the hangover the
     // renderer short-circuits instead of running the separator on nothing.
     int silent_hops_ = 0;
@@ -219,9 +248,6 @@ private:
 
     Convolver direct_;
     Convolver room_;
-    std::vector<float> room_game_;
-    std::vector<float> room_movie_;
-    std::vector<float> room_music_;
 
     DelayLine ambience_delay_;
     DelayLine speaker_delay_;
@@ -252,8 +278,9 @@ private:
     std::array<float, 2 * kHop> room_out_{};
 
     void process_hop();
+    void take_snapshot();
+    void maybe_start_neural();
     bool detect_surround();
-    const char* ort_library_path() const;
     void make_stereo_feeds(bool& has_lfe);
     void make_surround_feeds(bool& has_lfe);
     void render_headphones(bool has_lfe, float* out_l, float* out_r);

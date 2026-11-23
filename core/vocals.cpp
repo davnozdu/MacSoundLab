@@ -27,17 +27,41 @@ namespace ally {
 
 namespace {
 
-struct QueuedHop {
-    uint64_t gen;
-    uint64_t seq;
-    std::vector<float> audio; // 2 * kHop
+constexpr int kHopFrames = PipelinedVocals::kHop;
+constexpr size_t kQueueSlots = 32;
+
+struct InSlot {
+    uint64_t gen = 0;
+    uint64_t seq = 0;
+    std::array<float, 2 * kHopFrames> audio{};
 };
 
-struct OutHop {
-    uint64_t gen;
-    uint64_t seq;
-    std::vector<float> dry;  // 2 * kHop
-    std::vector<float> rest; // 2 * kHop
+struct OutSlot {
+    uint64_t gen = 0;
+    uint64_t seq = 0;
+    std::array<float, 2 * kHopFrames> dry{};
+    std::array<float, 2 * kHopFrames> rest{};
+};
+
+// Fixed-capacity FIFO: the audio thread must not allocate, and std::deque of
+// std::vector allocated twice per hop (375 times a second).
+template <typename T>
+struct Fifo {
+    std::array<T, kQueueSlots> items{};
+    size_t head = 0;
+    size_t count = 0;
+
+    bool empty() const { return count == 0; }
+    size_t size() const { return count; }
+    T& front() { return items[head]; }
+    void pop() { head = (head + 1) % kQueueSlots; --count; }
+    T* push() {
+        if (count == kQueueSlots) return nullptr;
+        T* slot = &items[(head + count) % kQueueSlots];
+        ++count;
+        return slot;
+    }
+    void clear() { head = 0; count = 0; }
 };
 
 } // namespace
@@ -52,17 +76,24 @@ struct PipelinedVocals::Impl {
 
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
+    std::vector<const char*> input_ptrs;
+    std::vector<const char*> output_ptrs;
     std::vector<std::vector<int64_t>> state_shapes;
     std::vector<std::vector<float>> state_bufs;
     std::vector<float> prev_in; // 2 * kHop
+
+    // Input tensors wrap fixed buffers and are created once, not per run.
+    std::array<float, 2 * kHopFrames> audio_buf{};
+    std::vector<OrtValue*> in_vals;
+    std::vector<OrtValue*> out_vals;
 
     std::mutex mutex;
     std::condition_variable cv;
     bool stop = false;
     std::thread worker;
 
-    std::deque<QueuedHop> inbox;
-    std::deque<OutHop> outbox;
+    Fifo<InSlot> inbox;
+    Fifo<OutSlot> outbox;
     uint64_t gen = 0;
     uint64_t seq = 0;
     uint64_t last_tick = UINT64_MAX;
@@ -72,6 +103,14 @@ struct PipelinedVocals::Impl {
     std::vector<float> fallback_buf;
     size_t fallback_pos = 0;
 
+    // Releases a status; true when there was no error.
+    bool ok(OrtStatus* status) const {
+        if (status == nullptr) return true;
+        VLOGE("onnxruntime: %s", api->GetErrorMessage(status));
+        api->ReleaseStatus(status);
+        return false;
+    }
+
     void reset_states() {
         for (auto& b : state_bufs) {
             std::fill(b.begin(), b.end(), 0.0f);
@@ -79,76 +118,72 @@ struct PipelinedVocals::Impl {
         std::fill(prev_in.begin(), prev_in.end(), 0.0f);
     }
 
-    bool run_model(const float* in_audio, float* out_dry, float* out_rest) {
-        if (!api || !session) return false;
-
-        std::vector<const char*> in_ptrs;
-        std::vector<OrtValue*> in_vals;
-        std::vector<const char*> out_ptrs;
-        std::vector<OrtValue*> out_vals(output_names.size(), nullptr);
-
-        int64_t audio_shape[3] = {1, 2, kHop};
+    bool bind_inputs() {
+        int64_t audio_shape[3] = {1, 2, kHopFrames};
         OrtValue* audio_val = nullptr;
-        OrtStatus* st = api->CreateTensorWithDataAsOrtValue(
-            mem_info, const_cast<float*>(in_audio), 2 * kHop * sizeof(float),
-            audio_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &audio_val);
-        if (st) {
-            api->ReleaseStatus(st);
+        if (!ok(api->CreateTensorWithDataAsOrtValue(mem_info, audio_buf.data(), audio_buf.size() * sizeof(float),
+                                                    audio_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &audio_val))) {
             return false;
         }
-        in_ptrs.push_back(input_names[0].c_str());
         in_vals.push_back(audio_val);
-
         for (size_t i = 0; i < state_bufs.size(); ++i) {
             OrtValue* sv = nullptr;
-            st = api->CreateTensorWithDataAsOrtValue(
-                mem_info, state_bufs[i].data(), state_bufs[i].size() * sizeof(float),
-                state_shapes[i].data(), state_shapes[i].size(),
-                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &sv);
-            if (st) {
-                api->ReleaseStatus(st);
-                for (auto* v : in_vals) api->ReleaseValue(v);
+            if (!ok(api->CreateTensorWithDataAsOrtValue(mem_info, state_bufs[i].data(),
+                                                        state_bufs[i].size() * sizeof(float),
+                                                        state_shapes[i].data(), state_shapes[i].size(),
+                                                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &sv))) {
                 return false;
             }
-            in_ptrs.push_back(input_names[i + 1].c_str());
             in_vals.push_back(sv);
         }
+        for (const auto& name : input_names) input_ptrs.push_back(name.c_str());
+        for (const auto& name : output_names) output_ptrs.push_back(name.c_str());
+        out_vals.assign(output_names.size(), nullptr);
+        return in_vals.size() == input_names.size();
+    }
 
-        for (const auto& name : output_names) {
-            out_ptrs.push_back(name.c_str());
-        }
+    void release_values() {
+        if (!api) return;
+        for (auto* v : in_vals) if (v) api->ReleaseValue(v);
+        in_vals.clear();
+    }
 
-        st = api->Run(session, nullptr, in_ptrs.data(), in_vals.data(), in_vals.size(),
-                      out_ptrs.data(), out_ptrs.size(), out_vals.data());
+    bool run_model(const float* in_audio, float* out_dry, float* out_rest) {
+        if (!api || !session || in_vals.empty()) return false;
+        std::memcpy(audio_buf.data(), in_audio, audio_buf.size() * sizeof(float));
+        std::fill(out_vals.begin(), out_vals.end(), nullptr);
 
-        for (auto* v : in_vals) api->ReleaseValue(v);
-
-        if (st) {
-            api->ReleaseStatus(st);
-            for (auto* v : out_vals) if (v) api->ReleaseValue(v);
+        if (!ok(api->Run(session, nullptr, input_ptrs.data(), in_vals.data(), in_vals.size(),
+                         output_ptrs.data(), output_ptrs.size(), out_vals.data()))) {
+            for (auto*& v : out_vals) if (v) { api->ReleaseValue(v); v = nullptr; }
             return false;
         }
 
+        bool good = true;
         float* vocals_data = nullptr;
-        api->GetTensorMutableData(out_vals[0], reinterpret_cast<void**>(&vocals_data));
-        std::memcpy(out_dry, prev_in.data(), 2 * kHop * sizeof(float));
-        std::memcpy(prev_in.data(), in_audio, 2 * kHop * sizeof(float));
-        for (int i = 0; i < 2 * kHop; ++i) {
-            out_rest[i] = out_dry[i] - vocals_data[i];
+        good = ok(api->GetTensorMutableData(out_vals[0], reinterpret_cast<void**>(&vocals_data))) && vocals_data;
+        if (good) {
+            std::memcpy(out_dry, prev_in.data(), 2 * kHopFrames * sizeof(float));
+            std::memcpy(prev_in.data(), in_audio, 2 * kHopFrames * sizeof(float));
+            for (int i = 0; i < 2 * kHopFrames; ++i) {
+                out_rest[i] = out_dry[i] - vocals_data[i];
+            }
+            // The state tensors wrap state_bufs, which this run read as input:
+            // the new state is copied back only after the run has finished.
+            for (size_t i = 0; i < state_bufs.size() && i + 1 < out_vals.size(); ++i) {
+                float* sdata = nullptr;
+                if (ok(api->GetTensorMutableData(out_vals[i + 1], reinterpret_cast<void**>(&sdata))) && sdata) {
+                    std::memcpy(state_bufs[i].data(), sdata, state_bufs[i].size() * sizeof(float));
+                }
+            }
         }
-
-        for (size_t i = 0; i < state_bufs.size(); ++i) {
-            float* sdata = nullptr;
-            api->GetTensorMutableData(out_vals[i + 1], reinterpret_cast<void**>(&sdata));
-            std::memcpy(state_bufs[i].data(), sdata, state_bufs[i].size() * sizeof(float));
-        }
-
-        for (auto* v : out_vals) if (v) api->ReleaseValue(v);
-        return true;
+        for (auto*& v : out_vals) if (v) { api->ReleaseValue(v); v = nullptr; }
+        return good;
     }
 };
 
 PipelinedVocals::~PipelinedVocals() {
+    if (loader_.joinable()) loader_.join();
     if (!impl_) return;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -159,6 +194,7 @@ PipelinedVocals::~PipelinedVocals() {
         impl_->worker.join();
     }
     if (impl_->api) {
+        impl_->release_values();
         if (impl_->session) impl_->api->ReleaseSession(impl_->session);
         if (impl_->opts) impl_->api->ReleaseSessionOptions(impl_->opts);
         if (impl_->mem_info) impl_->api->ReleaseMemoryInfo(impl_->mem_info);
@@ -169,11 +205,36 @@ PipelinedVocals::~PipelinedVocals() {
     impl_ = nullptr;
 }
 
+void PipelinedVocals::load_async(const std::string& model_path, bool use_npu, const std::string& ort_library) {
+    if (ready_.load() || failed_.load()) return;
+    bool expected = false;
+    if (!load_started_.compare_exchange_strong(expected, true)) return;
+    loader_ = std::thread([this, model_path, use_npu, ort_library]() {
+        ensure_loaded(model_path.c_str(), use_npu, ort_library.empty() ? nullptr : ort_library.c_str());
+    });
+}
+
 bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const char* ort_library) {
+    std::lock_guard<std::mutex> guard(load_mutex_);
     if (ready_.load()) return true;
     if (failed_.load()) return false;
 
     auto* d = new Impl();
+    auto fail = [&]() {
+        failed_.store(true);
+        npu_active_.store(false);
+        if (d->api) {
+            d->release_values();
+            if (d->session) d->api->ReleaseSession(d->session);
+            if (d->opts) d->api->ReleaseSessionOptions(d->opts);
+            if (d->mem_info) d->api->ReleaseMemoryInfo(d->mem_info);
+            if (d->env) d->api->ReleaseEnv(d->env);
+        }
+        if (d->ort_lib) dlclose(d->ort_lib);
+        delete d;
+        return false;
+    };
+
     // The library ships with the app (Contents/Frameworks) or next to the
     // module binary; the plain name covers an install onto the dyld path.
     const char* kOrtCandidates[] = {
@@ -198,50 +259,35 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
         }
         VLOGE("dlopen %s failed: %s", cand, dlerror());
     }
-    if (!d->ort_lib) {
-        failed_.store(true);
-        delete d;
-        return false;
-    }
+    if (!d->ort_lib) return fail();
 
     using GetApiBaseFn = const OrtApiBase* (*)();
     auto get_base = reinterpret_cast<GetApiBaseFn>(dlsym(d->ort_lib, "OrtGetApiBase"));
     if (!get_base) {
         VLOGE("OrtGetApiBase not found");
-        failed_.store(true);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
+        return fail();
     }
     d->api = get_base()->GetApi(ORT_API_VERSION);
     if (!d->api) {
         VLOGE("OrtApi version %d unavailable", ORT_API_VERSION);
-        failed_.store(true);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
+        return fail();
     }
-
-    if (auto* st = d->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "AllySound", &d->env)) {
-        d->api->ReleaseStatus(st);
-        failed_.store(true);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
-    }
+    if (!d->ok(d->api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "AllySound", &d->env))) return fail();
 
     auto create_session = [&](bool try_accel) -> bool {
         if (d->opts) { d->api->ReleaseSessionOptions(d->opts); d->opts = nullptr; }
-        d->api->CreateSessionOptions(&d->opts);
-        // One thread: the model needs ~0.6 ms of a 2.67 ms block, and every
+        if (!d->ok(d->api->CreateSessionOptions(&d->opts))) return false;
+        // One thread: the model needs ~0.5 ms of a 2.67 ms block, and every
         // extra ORT thread spins between hops and keeps a core busy for nothing.
         // Spinning is off for the same reason - the wake-up cost is smaller
         // than the idle burn at this block rate.
-        d->api->SetIntraOpNumThreads(d->opts, 1);
-        d->api->SetInterOpNumThreads(d->opts, 1);
-        d->api->AddSessionConfigEntry(d->opts, "session.intra_op.allow_spinning", "0");
-        d->api->AddSessionConfigEntry(d->opts, "session.inter_op.allow_spinning", "0");
-        d->api->AddSessionConfigEntry(d->opts, "session.use_spinning", "0");
+        d->ok(d->api->SetIntraOpNumThreads(d->opts, 1));
+        d->ok(d->api->SetInterOpNumThreads(d->opts, 1));
+        d->ok(d->api->SetSessionGraphOptimizationLevel(d->opts, ORT_ENABLE_ALL));
+        d->ok(d->api->AddSessionConfigEntry(d->opts, "session.intra_op.allow_spinning", "0"));
+        d->ok(d->api->AddSessionConfigEntry(d->opts, "session.inter_op.allow_spinning", "0"));
+        d->ok(d->api->AddSessionConfigEntry(d->opts, "session.use_spinning", "0"));
+        npu_active_.store(false);
         if (try_accel) {
 #ifdef __ANDROID__
             using AccelFn = OrtStatus* (*)(OrtSessionOptions*, uint32_t);
@@ -255,18 +301,13 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
                 dlsym(d->ort_lib, "OrtSessionOptionsAppendExecutionProvider_CoreML"));
             const char* label = "CoreML";
 #endif
-            if (append) {
-                OrtStatus* ast = append(d->opts, 0);
-                if (!ast) {
-                    npu_active_.store(true);
-                } else {
-                    VLOGI("%s EP unavailable (%s), using CPU", label, d->api->GetErrorMessage(ast));
-                    d->api->ReleaseStatus(ast);
-                    npu_active_.store(false);
-                }
+            if (!append) return false;
+            OrtStatus* ast = append(d->opts, 0);
+            if (ast) {
+                VLOGI("%s EP unavailable (%s), using CPU", label, d->api->GetErrorMessage(ast));
+                d->api->ReleaseStatus(ast);
+                return false;
             }
-        } else {
-            npu_active_.store(false);
         }
         OrtStatus* sst = d->api->CreateSession(d->env, model_path, d->opts, &d->session);
         if (sst) {
@@ -275,40 +316,39 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
             d->session = nullptr;
             return false;
         }
+        npu_active_.store(try_accel);
         return true;
     };
 
-    if (!(use_npu && create_session(true)) && !create_session(false)) {
-        failed_.store(true);
-        d->api->ReleaseEnv(d->env);
-        dlclose(d->ort_lib);
-        delete d;
-        return false;
-    }
+    if (!(use_npu && create_session(true)) && !create_session(false)) return fail();
 
-    d->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &d->mem_info);
+    if (!d->ok(d->api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &d->mem_info))) return fail();
 
     OrtAllocator* alloc = nullptr;
-    d->api->GetAllocatorWithDefaultOptions(&alloc);
+    if (!d->ok(d->api->GetAllocatorWithDefaultOptions(&alloc))) return fail();
     size_t num_in = 0, num_out = 0;
-    d->api->SessionGetInputCount(d->session, &num_in);
-    d->api->SessionGetOutputCount(d->session, &num_out);
+    if (!d->ok(d->api->SessionGetInputCount(d->session, &num_in)) ||
+        !d->ok(d->api->SessionGetOutputCount(d->session, &num_out)) || num_in == 0 || num_out == 0) {
+        return fail();
+    }
 
     for (size_t i = 0; i < num_in; ++i) {
         char* name = nullptr;
-        d->api->SessionGetInputName(d->session, i, alloc, &name);
+        if (!d->ok(d->api->SessionGetInputName(d->session, i, alloc, &name)) || !name) return fail();
         d->input_names.emplace_back(name);
-        d->api->AllocatorFree(alloc, name);
+        d->ok(d->api->AllocatorFree(alloc, name));
 
         if (i > 0) {
             OrtTypeInfo* ti = nullptr;
-            d->api->SessionGetInputTypeInfo(d->session, i, &ti);
+            if (!d->ok(d->api->SessionGetInputTypeInfo(d->session, i, &ti))) return fail();
             const OrtTensorTypeAndShapeInfo* si = nullptr;
-            d->api->CastTypeInfoToTensorInfo(ti, &si);
             size_t dims = 0;
-            d->api->GetDimensionsCount(si, &dims);
+            bool good = d->ok(d->api->CastTypeInfoToTensorInfo(ti, &si)) && si &&
+                        d->ok(d->api->GetDimensionsCount(si, &dims));
             std::vector<int64_t> shape(dims);
-            d->api->GetDimensions(si, shape.data(), dims);
+            good = good && d->ok(d->api->GetDimensions(si, shape.data(), dims));
+            d->api->ReleaseTypeInfo(ti);
+            if (!good) return fail();
             size_t total = 1;
             for (auto& dim : shape) {
                 if (dim <= 0) dim = 1;
@@ -316,23 +356,21 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
             }
             d->state_shapes.push_back(std::move(shape));
             d->state_bufs.emplace_back(total, 0.0f);
-            d->api->ReleaseTypeInfo(ti);
         }
     }
     for (size_t i = 0; i < num_out; ++i) {
         char* name = nullptr;
-        d->api->SessionGetOutputName(d->session, i, alloc, &name);
+        if (!d->ok(d->api->SessionGetOutputName(d->session, i, alloc, &name)) || !name) return fail();
         d->output_names.emplace_back(name);
-        d->api->AllocatorFree(alloc, name);
+        d->ok(d->api->AllocatorFree(alloc, name));
     }
 
     d->prev_in.assign(2 * kHop, 0.0f);
     d->fallback_buf.assign((1 + kBufferHops) * 2 * kHop, 0.0f);
+    if (!d->bind_inputs()) return fail();
 
     // Warm up
-    std::vector<float> zeros(2 * kHop, 0.0f);
-    std::vector<float> d_tmp(2 * kHop, 0.0f);
-    std::vector<float> r_tmp(2 * kHop, 0.0f);
+    std::array<float, 2 * kHop> zeros{}, d_tmp{}, r_tmp{};
     for (int i = 0; i < 4; ++i) {
         d->run_model(zeros.data(), d_tmp.data(), r_tmp.data());
     }
@@ -347,14 +385,15 @@ bool PipelinedVocals::ensure_loaded(const char* model_path, bool use_npu, const 
 
 void PipelinedVocals::worker_loop() {
     uint64_t worker_gen = UINT64_MAX;
+    InSlot item;
+    OutSlot out;
     while (true) {
-        QueuedHop item;
         {
             std::unique_lock<std::mutex> lock(impl_->mutex);
             impl_->cv.wait(lock, [&]() { return impl_->stop || !impl_->inbox.empty(); });
             if (impl_->stop) break;
-            item = std::move(impl_->inbox.front());
-            impl_->inbox.pop_front();
+            item = impl_->inbox.front();
+            impl_->inbox.pop();
         }
 
         if (item.gen != worker_gen) {
@@ -362,11 +401,7 @@ void PipelinedVocals::worker_loop() {
             worker_gen = item.gen;
         }
 
-        OutHop out;
         out.gen = item.gen;
-        out.seq = item.seq;
-        out.dry.resize(2 * kHop);
-        out.rest.resize(2 * kHop);
         const auto started = std::chrono::steady_clock::now();
         const bool ok = impl_->run_model(item.audio.data(), out.dry.data(), out.rest.data());
         const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -378,7 +413,7 @@ void PipelinedVocals::worker_loop() {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             if (item.gen == impl_->gen && item.seq >= 1) {
                 out.seq = item.seq - 1;
-                impl_->outbox.push_back(std::move(out));
+                if (OutSlot* slot = impl_->outbox.push()) *slot = out;
             }
         }
     }
@@ -403,7 +438,7 @@ void PipelinedVocals::passive_matrix(const float* dry, float* rest) {
 }
 
 void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* rest_out, uint64_t tick) {
-    if (!ready_.load() || !impl_) {
+    if (!ready_.load(std::memory_order_acquire) || !impl_) {
         std::memcpy(dry_out, stereo_in, 2 * kHop * sizeof(float));
         passive_matrix(dry_out, rest_out);
         return;
@@ -432,8 +467,11 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
             impl_->wet = 0.0f;
         }
         cur_gen = impl_->gen;
-        QueuedHop q{cur_gen, cur_seq, std::vector<float>(stereo_in, stereo_in + 2 * kHop)};
-        impl_->inbox.push_back(std::move(q));
+        if (InSlot* slot = impl_->inbox.push()) {
+            slot->gen = cur_gen;
+            slot->seq = cur_seq;
+            std::memcpy(slot->audio.data(), stereo_in, 2 * kHop * sizeof(float));
+        }
     }
     impl_->cv.notify_one();
 
@@ -451,41 +489,35 @@ void PipelinedVocals::process(const float* stereo_in, float* dry_out, float* res
         return;
     }
 
-    uint64_t target_seq = cur_seq - delay_hops;
+    const uint64_t target_seq = cur_seq - delay_hops;
     bool got = false;
-    OutHop res;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        while (!impl_->outbox.empty() &&
-               (impl_->outbox.front().gen != cur_gen || impl_->outbox.front().seq < target_seq)) {
-            impl_->outbox.pop_front();
+        auto& box = impl_->outbox;
+        while (!box.empty() && (box.front().gen != cur_gen || box.front().seq < target_seq)) {
+            box.pop();
         }
-        if (!impl_->outbox.empty() &&
-            impl_->outbox.front().gen == cur_gen &&
-            impl_->outbox.front().seq == target_seq) {
-            res = std::move(impl_->outbox.front());
-            impl_->outbox.pop_front();
+        if (!box.empty() && box.front().gen == cur_gen && box.front().seq == target_seq) {
+            const OutSlot& res = box.front();
+            std::memcpy(dry_out, res.dry.data(), 2 * kHop * sizeof(float));
+            if (impl_->wet < 1.0f) {
+                std::array<float, 2 * kHop> p_rest{};
+                passive_matrix(dry_out, p_rest.data());
+                const float step = (1.0f - impl_->wet) / static_cast<float>(kHop - 1);
+                for (int i = 0; i < kHop; ++i) {
+                    const float w = impl_->wet + step * i;
+                    rest_out[i] = p_rest[i] * (1.0f - w) + res.rest[i] * w;
+                    rest_out[kHop + i] = p_rest[kHop + i] * (1.0f - w) + res.rest[kHop + i] * w;
+                }
+                impl_->wet = 1.0f;
+            } else {
+                std::memcpy(rest_out, res.rest.data(), 2 * kHop * sizeof(float));
+            }
+            box.pop();
             got = true;
         }
     }
-
-    if (got) {
-        std::memcpy(dry_out, res.dry.data(), 2 * kHop * sizeof(float));
-        if (impl_->wet < 1.0f) {
-            std::array<float, 2 * kHop> p_rest{};
-            passive_matrix(dry_out, p_rest.data());
-            float step = (1.0f - impl_->wet) / static_cast<float>(kHop - 1);
-            for (int i = 0; i < kHop; ++i) {
-                float w = impl_->wet + step * i;
-                rest_out[i] = p_rest[i] * (1.0f - w) + res.rest[i] * w;
-                rest_out[kHop + i] = p_rest[kHop + i] * (1.0f - w) + res.rest[kHop + i] * w;
-            }
-            impl_->wet = 1.0f;
-        } else {
-            std::memcpy(rest_out, res.rest.data(), 2 * kHop * sizeof(float));
-        }
-        return;
-    }
+    if (got) return;
 
     drops_.fetch_add(1);
     impl_->wet = 0.0f;

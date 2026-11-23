@@ -16,7 +16,11 @@ constexpr double kSurroundHold = 1.0;
 constexpr float kAmbienceDelaySec = 0.015f;
 constexpr float kRoomSeconds = 0.45f;
 constexpr float kSurroundTrim = 0.65313055f;       // 10^(-3.7/20)
-constexpr float kStereoTrim = 1.6595869f;          // 10^(+4.4/20)
+// Was +4.4 dB: with it Game and Music on headphones came out ~5 dB louder
+// than the input, every master louder than about -12 dBFS RMS ran into the
+// limiter (block-wise gain, audible as pumping), and the bypass A/B compared
+// against a louder signal. -0.6 dB puts pink noise back at unity.
+constexpr float kStereoTrim = 0.9332543f;          // 10^(-0.6/20)
 constexpr float kSpeakerTrimStereo = 0.7762471f;   // 10^(-2.2/20)
 constexpr float kSpeakerTrimSurround = 0.3981072f; // 10^(-8.0/20)
 
@@ -26,7 +30,10 @@ constexpr float kSpeakerTrimSurround = 0.3981072f; // 10^(-8.0/20)
 constexpr float kGlassesBassGain = 0.2589254f;     // 10^(2.0/20) - 1
 
 struct ProfileParams {
-    float dialogue;
+    float dialogue;      // centre gain for the separated voice (neural path)
+    float passive_centre; // centre gain without the separator: the passive 50%
+                          // split leaves most of the voice in FL/FR, so the
+                          // centre needs more to lift dialogue at all
     float room;
     float rt60;
     bool compress;
@@ -37,18 +44,23 @@ struct ProfileParams {
 ProfileParams get_profile_params(Profile p) {
     switch (p) {
         case Profile::Movie:
-            return {1.2589254f, 0.26f, 0.40f, true, 0.48f, 0.42f};
+            // Passive centre x2.0: measured +1.7 dB voice over background vs Game
+            // (x1.26 gave +0.1). With the separator the voice is already
+            // isolated (+15 dB in its stem), so the neural path keeps x1.26.
+            return {1.2589254f, 2.0f, 0.26f, 0.40f, true, 0.48f, 0.42f};
         case Profile::Music:
-            return {1.0f, 0.28f, 0.25f, false, 0.38f, 0.32f};
+            return {1.0f, 1.0f, 0.28f, 0.25f, false, 0.38f, 0.32f};
         case Profile::Speech:
             // Podcast / audiobook: dialogue lifted and compressed, but the stereo
             // image of the source is kept - a YouTube talk still has music and
             // effects at the sides, and collapsing them to mono is not "cleaner",
             // it is just flat. The room follows the user's switch.
-            return {1.20f, 0.26f, 0.22f, true, 0.45f, 0.30f};
+            // Ambience trimmed against the other profiles: it was the main
+            // masker of the voice on headphones.
+            return {1.20f, 1.8f, 0.26f, 0.22f, true, 0.30f, 0.18f};
         case Profile::Game:
         default:
-            return {1.0f, 0.30f, 0.22f, false, 0.45f, 0.40f};
+            return {1.0f, 1.0f, 0.30f, 0.22f, false, 0.45f, 0.40f};
     }
 }
 
@@ -280,18 +292,23 @@ void Convolver::init(int sources, int ears, int length, const float* responses, 
     sources_ = sources;
     ears_ = ears;
     diagonal_ = diagonal;
+    length_ = length;
     parts_ = (length + kHop - 1) / kHop;
     const size_t bins = fft_.bins();
-    spectra_.assign(parts_ * sources_ * ears_ * bins, {0.0f, 0.0f});
+    sets_.clear();
+    active_ = 0;
     history_.assign(parts_ * sources_ * bins, {0.0f, 0.0f});
     previous_.assign(sources_ * kHop, 0.0f);
     accum_.assign(ears_ * bins, {0.0f, 0.0f});
     frame_buf_.assign(2 * kHop, 0.0f);
-    set_responses(length, responses);
+    add_response_set(length, responses);
 }
 
-void Convolver::set_responses(int length, const float* responses) {
+int Convolver::add_response_set(int length, const float* responses) {
     const size_t bins = fft_.bins();
+    sets_.emplace_back(static_cast<size_t>(parts_) * sources_ * ears_ * bins, std::complex<float>{0.0f, 0.0f});
+    auto& spectra = sets_.back();
+    length = std::min(length, length_);
     std::vector<float> part_buf(2 * kHop, 0.0f);
     for (int s = 0; s < sources_; ++s) {
         for (int e = 0; e < ears_; ++e) {
@@ -303,11 +320,12 @@ void Convolver::set_responses(int length, const float* responses) {
                 if (count > 0) {
                     std::memcpy(part_buf.data(), src + start, count * sizeof(float));
                 }
-                std::complex<float>* dst = &spectra_[((p * sources_ + s) * ears_ + e) * bins];
+                std::complex<float>* dst = &spectra[((p * sources_ + s) * ears_ + e) * bins];
                 fft_.forward(part_buf.data(), dst);
             }
         }
     }
+    return static_cast<int>(sets_.size()) - 1;
 }
 
 void Convolver::reset() {
@@ -347,6 +365,7 @@ void Convolver::process(const float* in, float* out) {
     }
 
     std::fill(accum_.begin(), accum_.end(), std::complex<float>{0.0f, 0.0f});
+    const std::complex<float>* spectra = sets_[static_cast<size_t>(active_)].data();
     // Walk the ring backwards from the newest frame: partition p lives in slot
     // (hist_pos_ - p). One wrap-around, no per-iteration modulo.
     int slot = hist_pos_;
@@ -354,7 +373,7 @@ void Convolver::process(const float* in, float* out) {
         for (int p = 0; p < parts_; ++p) {
             for (int s = 0; s < sources_; ++s) {
                 const auto* h = &history_[static_cast<size_t>(slot) * slice + s * bins];
-                const auto* sp = &spectra_[((p * sources_ + s) * ears_ + 0) * bins];
+                const auto* sp = &spectra[((p * sources_ + s) * ears_ + 0) * bins];
                 complex_mac(&accum_[s * bins], h, sp, bins);
             }
             if (--slot < 0) slot = parts_ - 1;
@@ -364,7 +383,7 @@ void Convolver::process(const float* in, float* out) {
             for (int s = 0; s < sources_; ++s) {
                 const auto* h = &history_[static_cast<size_t>(slot) * slice + s * bins];
                 for (int e = 0; e < ears_; ++e) {
-                    const auto* sp = &spectra_[((p * sources_ + s) * ears_ + e) * bins];
+                    const auto* sp = &spectra[((p * sources_ + s) * ears_ + e) * bins];
                     complex_mac(&accum_[e * bins], h, sp, bins);
                 }
             }
@@ -547,12 +566,17 @@ void Renderer::init(float sample_rate) {
     // Flatten kHrirKu100 [7][2][256]
     direct_.init(kNumSpeakers, 2, kHrirLength, &kHrirKu100[0][0][0], false);
 
-    room_game_ = generate_room_response(0.22f, sample_rate, 7);
-    room_movie_ = generate_room_response(0.40f, sample_rate, 7);
-    room_music_ = generate_room_response(0.25f, sample_rate, 7);
-
+    // All three rooms are transformed once, here. Switching profile is then
+    // only an index change on the audio thread; recomputing the spectra on the
+    // control thread raced with the convolver and its FFT scratch (audible clicks).
     const int room_len = static_cast<int>(kRoomSeconds * sample_rate);
-    room_.init(2, 2, room_len, room_game_.data(), false);
+    {
+        const auto game = generate_room_response(0.22f, sample_rate, 7);
+        room_.init(2, 2, room_len, game.data(), false);
+        room_set_game_ = 0;
+    }
+    room_set_movie_ = room_.add_response_set(room_len, generate_room_response(0.40f, sample_rate, 7).data());
+    room_set_music_ = room_.add_response_set(room_len, generate_room_response(0.25f, sample_rate, 7).data());
 
     ambience_delay_.init(2, static_cast<int>(kAmbienceDelaySec * sample_rate));
     speaker_delay_.init(1, static_cast<int>(0.012f * sample_rate));
@@ -575,7 +599,7 @@ void Renderer::init(float sample_rate) {
     widener_.init(sample_rate);
     dynamics_.init(sample_rate);
 
-    set_profile(profile_);
+    take_snapshot();
     reset();
 }
 
@@ -588,50 +612,107 @@ void Renderer::reset() {
     speaker_lfe_.reset();
     glasses_bass_.reset();
     cinema_air_.reset();
+    speech_hp_.reset();
+    speech_presence_.reset();
+    speech_tame_.reset();
+    speech_lift_lp_.reset();
+    glasses_air_.reset();
+    small_hp_.reset();
+    small_presence_.reset();
     widener_.reset();
     dynamics_.reset();
+    mono_weight_ = 0.0f;
     clock_ = 0.0;
     surround_seen_ = -1e9;
     is_surround_ = false;
+    surround_flag_.store(false, std::memory_order_relaxed);
     fifo_fill_ = 0;
     out_read_pos_ = 0;
     out_avail_ = 0;
 }
 
 void Renderer::set_profile(Profile p) {
-    profile_ = p;
-    const int room_len = static_cast<int>(kRoomSeconds * sample_rate_);
-    switch (p) {
-        case Profile::Movie:
-            room_.set_responses(room_len, room_movie_.data());
-            break;
-        case Profile::Music:
-            room_.set_responses(room_len, room_music_.data());
-            break;
-        case Profile::Speech:
+    req_profile_.store(p, std::memory_order_relaxed);
+    maybe_start_neural();
+}
+
+void Renderer::set_neural(bool enabled) {
+    req_neural_.store(enabled, std::memory_order_relaxed);
+    maybe_start_neural();
+}
+
+void Renderer::set_runtime_dir(const char* dir) {
+    runtime_dir_ = dir ? dir : "";
+    if (runtime_dir_.empty()) {
+        ort_library_.clear();
+    } else {
+#ifdef __APPLE__
+        ort_library_ = runtime_dir_ + "/libonnxruntime.dylib";
+#else
+        ort_library_ = runtime_dir_ + "/libonnxruntime.so";
+#endif
+    }
+    maybe_start_neural();
+}
+
+void Renderer::set_model_paths(const char* vocals, const char* speech) {
+    vocals_model_ = vocals ? vocals : "";
+    speech_model_ = speech && *speech ? speech : vocals_model_;
+    maybe_start_neural();
+}
+
+// The separator is only used by Movie with the neural switch on. Loading it
+// (dlopen, session, warm-up) takes hundreds of milliseconds, so it happens on
+// a background thread; the audio thread runs the passive matrix until ready.
+void Renderer::maybe_start_neural() {
+#ifdef ALLY_ENABLE_NPU
+    if (!req_neural_.load(std::memory_order_relaxed)) return;
+    if (req_profile_.load(std::memory_order_relaxed) != Profile::Movie) return;
+    if (vocals_model_.empty()) return;
+    // CPU only: CoreML compiles the model only as an MLProgram, and then it
+    // is slower than the CPU in every respect - 1.08 vs 0.48 ms per run and
+    // 1.21 vs 0.47 ms of CPU time (15 partitions, copies at every boundary).
+    vocals_.load_async(vocals_model_, false, ort_library_);
+#endif
+}
+
+bool Renderer::prepare_neural() {
+#ifdef ALLY_ENABLE_NPU
+    if (!req_neural_.load(std::memory_order_relaxed) || vocals_model_.empty()) return false;
+    return vocals_.ensure_loaded(vocals_model_.c_str(), false,
+                                 ort_library_.empty() ? nullptr : ort_library_.c_str());
+#else
+    return false;
+#endif
+}
+
+int Renderer::latency_frames() const {
+    int frames = kHop - 1;
+#ifdef ALLY_ENABLE_NPU
+    if (req_neural_.load(std::memory_order_relaxed) &&
+        req_profile_.load(std::memory_order_relaxed) == Profile::Movie && vocals_.is_ready()) {
+        frames += (1 + PipelinedVocals::kBufferHops) * kHop;
+    }
+#endif
+    return frames;
+}
+
+void Renderer::take_snapshot() {
+    const Profile wanted = req_profile_.load(std::memory_order_relaxed);
+    if (wanted != profile_ || tick_ == 0) {
+        switch (wanted) {
+            case Profile::Movie: room_.select_set(room_set_movie_); break;
+            case Profile::Music: room_.select_set(room_set_music_); break;
             // Speech borrows the short game room: a podcast should sound like a
             // small room, not a hall, but it must be audible when switched on.
-            room_.set_responses(room_len, room_game_.data());
-            break;
-        case Profile::Game:
-        default:
-            room_.set_responses(room_len, room_game_.data());
-            break;
+            default: room_.select_set(room_set_game_); break;
+        }
+        profile_ = wanted;
     }
-}
-
-void Renderer::set_device(DeviceKind d) {
-    device_ = d;
-}
-
-const char* Renderer::ort_library_path() const {
-    if (runtime_dir_.empty()) return nullptr;
-#ifdef __APPLE__
-    ort_library_ = runtime_dir_ + "/libonnxruntime.dylib";
-#else
-    ort_library_ = runtime_dir_ + "/libonnxruntime.so";
-#endif
-    return ort_library_.c_str();
+    device_ = req_device_.load(std::memory_order_relaxed);
+    neural_ = req_neural_.load(std::memory_order_relaxed);
+    reverb_ = req_reverb_.load(std::memory_order_relaxed);
+    bypass_ = req_bypass_.load(std::memory_order_relaxed);
 }
 
 void Renderer::stats(float* model_ms, uint64_t* drops) {
@@ -657,6 +738,7 @@ bool Renderer::detect_surround() {
         }
     }
     is_surround_ = (clock_ - surround_seen_) < kSurroundHold;
+    surround_flag_.store(is_surround_, std::memory_order_relaxed);
     return is_surround_;
 }
 
@@ -687,8 +769,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
     // that layer is audible as a crackle, and the separation buys only 1.7 dB of
     // presence - which the static EQ already provides, cleanly. So the model is
     // not used in this profile; the voice lift is done with a shelf instead.
-    if (neural_ && profile_ == Profile::Movie &&
-        vocals_.ensure_loaded(vocals_model_.c_str(), true, ort_library_path())) {
+    if (neural_ && profile_ == Profile::Movie && vocals_.is_ready()) {
         std::array<float, 2 * kHop> dry{};
         std::array<float, 2 * kHop> sep_rest{};
         vocals_.process(&block_[0], dry.data(), sep_rest.data(), tick_);
@@ -732,7 +813,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         float rest_r = fr[i] - voice;
         feeds_[0 * kHop + i] = rest_l;
         feeds_[1 * kHop + i] = rest_r;
-        feeds_[2 * kHop + i] = voice * cfg.dialogue;
+        feeds_[2 * kHop + i] = voice * cfg.passive_centre;
         amb[0 * kHop + i] = rest_l - 0.7f * rest_r;
         amb[1 * kHop + i] = rest_r - 0.7f * rest_l;
     }
@@ -757,7 +838,7 @@ void Renderer::make_stereo_feeds(bool& has_lfe) {
         mono_weight_ += (target - mono_weight_) * coeff;
         if (mono_weight_ > 0.001f) {
             for (int i = 0; i < kHop; ++i) {
-                const float mid = 0.5f * (fl[i] + fr[i]) * cfg.dialogue;
+                const float mid = 0.5f * (fl[i] + fr[i]) * cfg.passive_centre;
                 const float keep = 1.0f - mono_weight_;
                 for (int ch = 0; ch < 7; ++ch) {
                     feeds_[ch * kHop + i] *= keep;
@@ -910,11 +991,15 @@ void Renderer::render_speakers(bool has_lfe, float* out_l, float* out_r) {
     apply_speech_eq(out_l, out_r);
 
     // Small-speaker tuning, after the mix so it also shapes the room and the LFE.
-    std::array<float, kHop> hp_l{}, hp_r{};
-    small_hp_.process(out_l, hp_l.data(), 0, kHop);
-    small_hp_.process(out_r, hp_r.data(), 1, kHop);
-    small_presence_.process(hp_l.data(), out_l, 0, kHop);
-    small_presence_.process(hp_r.data(), out_r, 1, kHop);
+    // Speech already applies its own 95 Hz high-pass and 2.8 kHz presence shelf,
+    // so do not stack a second presence shelf on top of it.
+    if (profile_ != Profile::Speech) {
+        std::array<float, kHop> hp_l{}, hp_r{};
+        small_hp_.process(out_l, hp_l.data(), 0, kHop);
+        small_hp_.process(out_r, hp_r.data(), 1, kHop);
+        small_presence_.process(hp_l.data(), out_l, 0, kHop);
+        small_presence_.process(hp_r.data(), out_r, 1, kHop);
+    }
 }
 
 void Renderer::downmix(float* out_l, float* out_r) {
@@ -931,6 +1016,7 @@ void Renderer::downmix(float* out_l, float* out_r) {
 }
 
 void Renderer::process_hop() {
+    take_snapshot();
     tick_++;
     if (profile_ == Profile::Off) {
         std::memcpy(out_fifo_[0].data(), &block_[0 * kHop], kHop * sizeof(float));
@@ -998,18 +1084,21 @@ void Renderer::process_hop() {
     }
 
     const auto cfg = get_profile_params(profile_);
-    bool dynamic = cfg.compress || (device_ != DeviceKind::Headphones);
+    // Small speakers and glasses get the leveler and the compressor in every
+    // profile except Music: music keeps its mastered dynamics everywhere (it
+    // was squeezed from 34 dB of range to 16 dB on glasses). The peak limiter
+    // inside Dynamics always runs.
+    const bool small_device = device_ != DeviceKind::Headphones;
+    const bool dynamic = profile_ != Profile::Music && (cfg.compress || small_device);
     dynamics_.process(out_l, out_r, dynamic, dynamic);
     out_read_pos_ = 0;
     out_avail_ = kHop;
 }
 
 void Renderer::process_interleaved(const float* in, float* out, int frames, int in_channels) {
-    if (profile_ == Profile::Off && in_channels == 2) {
-        std::memcpy(out, in, static_cast<size_t>(frames) * 2 * sizeof(float));
-        return;
-    }
-
+    // No pass-through shortcut for Off: it skipped the hop FIFO, so switching
+    // Off <-> on jumped the latency by a hop and clicked. Off runs through the
+    // FIFO like everything else (a plain copy inside process_hop).
     for (int i = 0; i < frames; ++i) {
         const float* src = in + i * in_channels;
         if (in_channels == 2) {

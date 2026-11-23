@@ -4,45 +4,72 @@ import CoreAudio
 import Foundation
 import CSoundLab
 
+/// os_unfair_lock at a stable heap address. A lock stored as a plain Swift
+/// property and passed as `&lock` is not guaranteed to keep its address, which
+/// os_unfair_lock requires; NSLock is a pthread mutex and is heavier on the
+/// audio threads.
+final class UnfairLock {
+    private let pointer: UnsafeMutablePointer<os_unfair_lock>
+
+    init() {
+        pointer = .allocate(capacity: 1)
+        pointer.initialize(to: os_unfair_lock())
+    }
+
+    deinit {
+        pointer.deinitialize(count: 1)
+        pointer.deallocate()
+    }
+
+    @inline(__always) func lock() { os_unfair_lock_lock(pointer) }
+    @inline(__always) func unlock() { os_unfair_lock_unlock(pointer) }
+}
+
 /// Stereo float ring between the tap IOProc and the output unit, with a
 /// slowly adapting resample ratio so the two clocks never drift apart.
+/// Raw storage with a power-of-two mask: no array bounds or uniqueness checks
+/// and no 64-bit division per sample on the audio threads.
 final class AudioRing {
-    private var samples: [Float]
+    private let storage: UnsafeMutablePointer<Float>
     private let capacity: Int
+    private let mask: Int
     private var writeIndex: Int64 = 0
     private var readPosition: Double = 0
-    private var lock = os_unfair_lock_s()
+    private let lock = UnfairLock()
 
-    init(capacity: Int = 1 << 15) {
-        self.capacity = capacity
-        samples = [Float](repeating: 0, count: capacity * 2)
+    init(capacityPowerOfTwo: Int = 15) {
+        capacity = 1 << capacityPowerOfTwo
+        mask = capacity - 1
+        storage = .allocate(capacity: capacity * 2)
+        storage.initialize(repeating: 0, count: capacity * 2)
     }
 
-    private func sample(_ index: Int64, _ channel: Int) -> Float {
-        let slot = Int(index % Int64(capacity))
-        return samples[slot * 2 + channel]
+    deinit {
+        storage.deallocate()
     }
 
-    private func store(_ index: Int64, _ left: Float, _ right: Float) {
-        let slot = Int(index % Int64(capacity))
-        samples[slot * 2] = left
-        samples[slot * 2 + 1] = right
-    }
+    /// Frames the ring can hold before the writer overwrites unread audio.
+    var capacityFrames: Int { capacity }
 
     func write(_ input: UnsafePointer<Float>, frames: Int) {
-        os_unfair_lock_lock(&lock)
-        for i in 0..<frames {
-            store(writeIndex, input[2 * i], input[2 * i + 1])
-            writeIndex += 1
+        guard frames > 0 else { return }
+        lock.lock()
+        var done = 0
+        while done < frames {
+            let slot = Int(writeIndex + Int64(done)) & mask
+            let chunk = min(frames - done, capacity - slot)
+            (storage + slot * 2).update(from: input + done * 2, count: chunk * 2)
+            done += chunk
         }
-        os_unfair_lock_unlock(&lock)
+        writeIndex += Int64(frames)
+        lock.unlock()
     }
 
-    /// Seconds of audio sitting in the ring, from the reader's point of view.
+    /// Frames of audio sitting in the ring, from the reader's point of view.
     func fillFrames() -> Double {
-        os_unfair_lock_lock(&lock)
+        lock.lock()
         let fill = Double(writeIndex) - readPosition
-        os_unfair_lock_unlock(&lock)
+        lock.unlock()
         return fill
     }
 
@@ -50,43 +77,78 @@ final class AudioRing {
     /// Returns how many were produced; the caller silences the remainder.
     @discardableResult
     func read(into output: UnsafeMutablePointer<Float>, frames: Int, step: Double) -> Int {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
+        lock.lock()
+        defer { lock.unlock() }
 
         let available = Double(writeIndex) - readPosition
         if available <= 0 {
             readPosition = Double(writeIndex)
             return 0
         }
-        let needed = Double(frames) * step
-        if available < needed {
+        // One extra frame: interpolation reads base + 1.
+        if available < Double(frames) * step + 1 {
             return 0
         }
+        var position = readPosition
         for i in 0..<frames {
-            let base = Int64(readPosition.rounded(.down))
-            let fraction = Float(readPosition - Double(base))
-            for channel in 0..<2 {
-                let a = sample(base, channel)
-                let b = sample(base + 1, channel)
-                output[2 * i + channel] = a + (b - a) * fraction
-            }
-            readPosition += step
+            let whole = position.rounded(.down)
+            let fraction = Float(position - whole)
+            let base = Int(Int64(whole)) & mask
+            let next = (base + 1) & mask
+            let al = storage[base * 2], ar = storage[base * 2 + 1]
+            let bl = storage[next * 2], br = storage[next * 2 + 1]
+            output[2 * i] = al + (bl - al) * fraction
+            output[2 * i + 1] = ar + (br - ar) * fraction
+            position += step
         }
+        readPosition = position
         return frames
     }
 
-    /// After an underrun or overflow: drop the backlog and keep a known headroom.
+    /// After an overflow (the output stalled while the tap kept writing): drop
+    /// the backlog and keep a known headroom. Without this the stale audio
+    /// played late and the 0.2% drift correction took minutes to catch up.
     func resync(targetFrames: Double) {
-        os_unfair_lock_lock(&lock)
+        lock.lock()
         readPosition = max(0, Double(writeIndex) - targetFrames)
-        os_unfair_lock_unlock(&lock)
+        lock.unlock()
     }
 
     func reset() {
-        os_unfair_lock_lock(&lock)
+        lock.lock()
         writeIndex = 0
         readPosition = 0
-        os_unfair_lock_unlock(&lock)
+        lock.unlock()
+    }
+}
+
+/// Live numbers for the statistics panel. Kept apart from AudioEngine so a
+/// meter tick redraws only the panel that shows it, not the whole window and
+/// the menu bar item; values are published only when they visibly change.
+final class EngineMeters: ObservableObject {
+    @Published fileprivate(set) var dspMs: Double = 0
+    @Published fileprivate(set) var latencyMs: Int = 0
+    @Published fileprivate(set) var levelLeft: Float = 0
+    @Published fileprivate(set) var levelRight: Float = 0
+    @Published fileprivate(set) var modelMs: Float = 0
+    @Published fileprivate(set) var modelDrops: UInt64 = 0
+    @Published fileprivate(set) var sourceIsSurround = false
+    @Published fileprivate(set) var neuralReady = false
+    @Published fileprivate(set) var accelActive = false
+
+    fileprivate func update<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<EngineMeters, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+    }
+
+    fileprivate func clear() {
+        update(\.dspMs, 0)
+        update(\.latencyMs, 0)
+        update(\.levelLeft, 0)
+        update(\.levelRight, 0)
+        update(\.modelMs, 0)
+        update(\.sourceIsSurround, false)
+        update(\.neuralReady, false)
+        update(\.accelActive, false)
     }
 }
 
@@ -104,6 +166,7 @@ struct EngineStats {
     var callbacks: Int = 0
     var lastFrames: Int = 0
     var silentReturns: Int = 0
+    var resyncs: Int = 0
 }
 
 enum EngineError: LocalizedError {
@@ -134,21 +197,15 @@ final class AudioEngine: ObservableObject {
     @Published private(set) var outputName = ""
     @Published private(set) var tapRate: Double = 0
     @Published private(set) var deviceKind: OutputKind = .headphones
-    @Published private(set) var sourceIsSurround = false
-    @Published private(set) var neuralReady = false
     private var lastReverbLog: Bool?
     private var dumpInHandle: FileHandle?
     private var dumpOutHandle: FileHandle?
     private var dumpFrames = 0
     private let muteOutput = ProcessInfo.processInfo.environment["SL_MUTE"] != nil
     private var lastPublishAt = CACurrentMediaTime()
-    @Published private(set) var accelActive = false
-    @Published private(set) var modelMs: Float = 0
-    @Published private(set) var modelDrops: UInt64 = 0
-    @Published private(set) var dspMs: Double = 0
-    @Published private(set) var ringFillMs: Double = 0
-    @Published private(set) var levelLeft: Float = 0
-    @Published private(set) var levelRight: Float = 0
+    /// Live statistics for the UI; observe this, not the engine, for meters.
+    let meters = EngineMeters()
+    private var modelDropsTotal: UInt64 = 0
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -159,7 +216,7 @@ final class AudioEngine: ObservableObject {
 
     private let ring = AudioRing()
     private let ioQueue = DispatchQueue(label: "cz.davnozdu.macsoundlab.tap", qos: .userInteractive)
-    private let statsLock = NSLock()
+    private let statsLock = UnfairLock()
     private var stats = EngineStats()
     private var inBuffer = [Float]()          // tap thread only
     private var tapOutBuffer = [Float]()      // tap thread only
@@ -173,7 +230,17 @@ final class AudioEngine: ObservableObject {
     private var baseStep: Double = 1.0
     private var primed = false
     private var resumeFade = 0
+    private static let resumeFadeFrames = 480
+    private static let maxBlockFrames = 4096
     private let targetFillFrames: Double = 1024   // ~21 ms of headroom
+    /// Past this the output has stalled (sleep, a Bluetooth reconnect): jump
+    /// back to the target instead of playing the backlog late.
+    private var maxFillFrames: Double { targetFillFrames * 4 }
+
+    func matchesOutput(_ output: AudioOutput) -> Bool {
+        guard let current = outputDevice else { return false }
+        return current.uid == output.uid && current.id == output.id && current.sampleRate == output.sampleRate
+    }
 
     // MARK: - lifecycle
 
@@ -242,12 +309,16 @@ final class AudioEngine: ObservableObject {
         }
         ring.reset()
         primed = false
+        resumeFade = 0
+        lastReverbLog = nil
+        dumpFrames = 0
         loggedFirstBlock = false
         outputDevice = nil
         isRunning = false
         stats = EngineStats()
-        levelLeft = 0
-        levelRight = 0
+        modelDropsTotal = 0
+        meters.update(\.modelDrops, 0)
+        meters.clear()
     }
 
     // MARK: - live parameters
@@ -304,6 +375,10 @@ final class AudioEngine: ObservableObject {
 
     private func startTap() throws {
         startDumpsIfRequested()
+        // Sized for the largest IO block the HAL hands out, so the IOProc never
+        // allocates on the audio thread.
+        if inBuffer.count < Self.maxBlockFrames * 2 { inBuffer = [Float](repeating: 0, count: Self.maxBlockFrames * 2) }
+        if tapOutBuffer.count < Self.maxBlockFrames * 2 { tapOutBuffer = [Float](repeating: 0, count: Self.maxBlockFrames * 2) }
         let ownProcess = AudioDevices.ownProcessObject()
         let excluded: [AudioObjectID] = ownProcess.map { [$0] } ?? []
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
@@ -331,7 +406,7 @@ final class AudioEngine: ObservableObject {
             AudioObjectGetPropertyData(tap, &descAddress, 0, nil, &descSize, pointer)
         }
         if readStatus == noErr, let returned {
-            NSLog("MacSoundLab: tap mute behavior = %d (asked for %d), name=\(returned.name ?? "-")",
+            NSLog("MacSoundLab: tap mute behavior = %d (asked for %d), name=\(returned.name)",
                   returned.muteBehavior.rawValue, CATapMuteBehavior.muted.rawValue)
         } else {
             NSLog("MacSoundLab: tap description read failed: %d", readStatus)
@@ -396,12 +471,15 @@ final class AudioEngine: ObservableObject {
         let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         guard list.count > 0 else { return }
 
-        let frames = list.map { Int($0.mDataByteSize) / (max(1, Int($0.mNumberChannels)) * 4) }.max() ?? 0
+        // A plain loop: list.map allocated an array on every IO callback.
+        var frames = 0
+        for buffer in list {
+            frames = max(frames, Int(buffer.mDataByteSize) / (max(1, Int(buffer.mNumberChannels)) * 4))
+        }
         guard frames > 0 else { return }
         statsLock.lock()
         stats.inFrames += UInt64(frames)
         statsLock.unlock()
-
 
 
         if logTicks == 0 && !loggedFirstBlock {
@@ -410,6 +488,8 @@ final class AudioEngine: ObservableObject {
                   frames, list.count, list[0].mNumberChannels)
         }
 
+        // Preallocated in startTap; growing here is a fallback for an unusually
+        // large block and allocates once.
         if inBuffer.count < frames * 2 { inBuffer = [Float](repeating: 0, count: frames * 2) }
         if tapOutBuffer.count < frames * 2 { tapOutBuffer = [Float](repeating: 0, count: frames * 2) }
 
@@ -450,6 +530,7 @@ final class AudioEngine: ObservableObject {
                     for i in 0..<frames * 2 { outBase[i] = 0 }
                 }
                 dump(dumpOutHandle, outBase, frames: frames)
+                if dumpInHandle != nil || dumpOutHandle != nil { dumpFrames += frames }
                 ring.write(outBase, frames: frames)
             }
         }
@@ -511,6 +592,9 @@ final class AudioEngine: ObservableObject {
             throw EngineError.noOutputUnit
         }
         outputUnit = unit
+        if renderBuffer.count < Self.maxBlockFrames * 2 {
+            renderBuffer = [Float](repeating: 0, count: Self.maxBlockFrames * 2)
+        }
 
         // Small buffer on the hardware side: 128 frames is ~2.7 ms at 48 kHz.
         var address = AudioDevices.propertyAddress(kAudioDevicePropertyBufferFrameSize)
@@ -523,7 +607,8 @@ final class AudioEngine: ObservableObject {
         }
 
         let startStatus = AudioOutputUnitStart(unit)
-        NSLog("MacSoundLab: output device=%u \"\(device.name)\" uid=\(device.uid) rate=\(outputRate) start=\(startStatus)")
+        NSLog("MacSoundLab: output device=%u \"%@\" uid=%@ rate=%.0f start=%d",
+              device.id, device.name, device.uid, outputRate, startStatus)
         guard startStatus == noErr else {
             AudioUnitUninitialize(unit)
             ComponentDispose(unit)
@@ -541,7 +626,15 @@ final class AudioEngine: ObservableObject {
         let frames = Int(frameCount)
         guard frames > 0, list.count > 0 else { return noErr }
 
-        let fill = ring.fillFrames()
+        var fill = ring.fillFrames()
+        if fill > maxFillFrames {
+            ring.resync(targetFrames: targetFillFrames)
+            fill = targetFillFrames
+            resumeFade = Self.resumeFadeFrames
+            statsLock.lock()
+            stats.resyncs += 1
+            statsLock.unlock()
+        }
 
         // The tap delivers whole blocks (often ~10 ms), the output unit pulls
         // 2.7 ms at a time: hold output until the ring is primed, otherwise the
@@ -573,14 +666,16 @@ final class AudioEngine: ObservableObject {
                 // Starved. Re-priming here used to cost a full 21 ms of silence,
                 // which is exactly the click the ear hears as a dropout; keep the
                 // stream alive and fade back in when the ring recovers.
-                resumeFade = 480
+                resumeFade = Self.resumeFadeFrames
                 statsLock.lock()
                 stats.underruns += 1
                 statsLock.unlock()
             } else if resumeFade > 0 {
                 let ramp = min(resumeFade, produced)
+                let total = Self.resumeFadeFrames
+                let done = total - resumeFade
                 for i in 0..<ramp {
-                    let gain = Float(resumeFade - i) / Float(resumeFade)
+                    let gain = Float(done + i) / Float(total)
                     base[2 * i] *= gain
                     base[2 * i + 1] *= gain
                 }
@@ -645,9 +740,18 @@ final class AudioEngine: ObservableObject {
 
     private func startUITimer() {
         uiTimer?.invalidate()
-        uiTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.publishStats()
         }
+        timer.tolerance = 0.1   // lets the system coalesce the wake-ups
+        RunLoop.main.add(timer, forMode: .common)
+        uiTimer = timer
+    }
+
+    /// True when some app window is on screen. Without one there is nobody to
+    /// look at the meters, so they are not published at all.
+    private var statsVisible: Bool {
+        NSApp?.windows.contains { $0.canBecomeMain && $0.isVisible && $0.occlusionState.contains(.visible) } ?? false
     }
 
     private func publishStats() {
@@ -658,6 +762,7 @@ final class AudioEngine: ObservableObject {
         var modelMs: Float = 0
         var drops: UInt64 = 0
         sl_stats(renderer, &modelMs, &drops)
+        modelDropsTotal += drops
 
         statsLock.lock()
         let blockCount = stats.blocks
@@ -668,41 +773,46 @@ final class AudioEngine: ObservableObject {
         let left = stats.levelLeft
         let right = stats.levelRight
         let outFrames = stats.outputFrames
-        let outPeak = stats.outputPeak
-        let cbs = stats.callbacks
-        let lastFr = stats.lastFrames
-        let silent = stats.silentReturns
         let inFr = stats.inFrames
         let underruns = stats.underruns
+        let resyncs = stats.resyncs
         stats.inFrames = 0
-        let consumed = blockCount
         stats.outputFrames = 0
         stats.outputPeak = 0
         stats.callbacks = 0
         stats.silentReturns = 0
         statsLock.unlock()
 
-        self.modelMs = modelMs
-        modelDrops += drops
-        dspMs = blockCount > 0 ? totalMs / Double(blockCount) : 0
-        ringFillMs = fill
-        levelLeft = left
-        levelRight = right
-        sourceIsSurround = sl_is_surround(renderer) == 1
-        neuralReady = sl_neural_ready(renderer) == 1
-        accelActive = sl_accel_active(renderer) == 1
+        let dsp = blockCount > 0 ? totalMs / Double(blockCount) : 0
+
+        if statsVisible {
+            // Rounded to what the panel shows, so an unchanged number does not
+            // trigger a redraw.
+            meters.update(\.dspMs, (dsp * 100).rounded() / 100)
+            meters.update(\.latencyMs, Int(estimatedLatencyMs))
+            meters.update(\.levelLeft, (left * 50).rounded() / 50)
+            meters.update(\.levelRight, (right * 50).rounded() / 50)
+            meters.update(\.modelMs, (modelMs * 100).rounded() / 100)
+            meters.update(\.modelDrops, modelDropsTotal)
+            meters.update(\.sourceIsSurround, sl_is_surround(renderer) == 1)
+            meters.update(\.neuralReady, sl_neural_ready(renderer) == 1)
+            meters.update(\.accelActive, sl_accel_active(renderer) == 1)
+        }
 
         logTicks += 1
-        if logTicks % 8 == 0 {
-            NSLog("MacSoundLab: live fill=%.0fms dsp=%.2fms peak=%.3f/%.3f model=%.2fms drops=%llu in=%.0f/s out=%.0f/s underruns=%d",
-                  fill, dspMs, left, right, modelMs, drops, Double(inFr) / elapsed,
-                  Double(outFrames) / elapsed, underruns)
+        if logTicks % 40 == 0 {   // every 10 s
+            NSLog("MacSoundLab: live fill=%.0fms dsp=%.2fms peak=%.3f/%.3f model=%.2fms drops=%llu in=%.0f/s out=%.0f/s underruns=%d resyncs=%d",
+                  fill, dsp, left, right, modelMs, modelDropsTotal, Double(inFr) / elapsed,
+                  Double(outFrames) / elapsed, underruns, resyncs)
         }
     }
 
-    /// Rough mouth-to-ear estimate shown in the UI.
+    /// Rough mouth-to-ear estimate shown in the UI: the ring, the tap block,
+    /// the output buffer and the renderer's own delay (which includes the
+    /// separator pipeline, ~29 ms, while Movie runs it).
     var estimatedLatencyMs: Double {
         let fill = ring.fillFrames() / Self.processingRate * 1000
-        return fill + 256.0 / Self.processingRate * 1000 + 128.0 / Self.processingRate * 1000
+        let dsp = renderer.map { Double(sl_latency_frames($0)) } ?? 0
+        return fill + (256.0 + 128.0 + dsp) / Self.processingRate * 1000
     }
 }

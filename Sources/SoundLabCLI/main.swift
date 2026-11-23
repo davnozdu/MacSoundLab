@@ -133,6 +133,8 @@ if let model = options["model"] {
     }
 }
 sl_set_bypass(renderer, flags.contains("bypass") ? 1 : 0)
+// Offline: wait for the separator instead of rendering the first seconds passive.
+if !flags.contains("no-neural") && profile == 2 { _ = sl_prepare_neural(renderer) }
 
 let totalFrames = stereo.count / 2
 var output = [Float](repeating: 0, count: totalFrames * 2)

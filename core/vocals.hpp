@@ -3,8 +3,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -26,11 +26,14 @@ public:
 
     // Lazy init: loads libonnxruntime and vocals.onnx. Returns true if ready.
     // ort_library: optional explicit path to the runtime library.
+    // Blocking; never call it from the audio thread.
     bool ensure_loaded(const char* model_path, bool use_npu = true, const char* ort_library = nullptr);
+    // Starts ensure_loaded on a background thread once; returns immediately.
+    void load_async(const std::string& model_path, bool use_npu, const std::string& ort_library);
     bool is_ready() const { return ready_.load(); }
     bool using_npu() const { return npu_active_.load(); }
 
-    // Non-blocking process: feeds one stereo hop (planar: 2 * kHop) and outputs
+    // Non-blocking, allocation-free process: feeds one stereo hop (planar: 2 * kHop) and outputs
     // time-aligned dry (2 * kHop) and rest = dry - vocals (2 * kHop).
     // Falls back smoothly to passive mid-side matrix on underrun.
     void process(const float* stereo_in, float* dry_out, float* rest_out, uint64_t tick);
@@ -42,6 +45,9 @@ public:
 private:
     struct Impl;
     Impl* impl_ = nullptr;
+    std::mutex load_mutex_;
+    std::thread loader_;
+    std::atomic<bool> load_started_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> failed_{false};
     std::atomic<bool> npu_active_{false};

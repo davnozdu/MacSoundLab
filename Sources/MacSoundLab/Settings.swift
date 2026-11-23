@@ -24,8 +24,8 @@ enum Profile: Int, CaseIterable, Identifiable {
         switch self {
         case .game: return "Точная локализация, сухая комната, динамика без компрессии"
         case .movie: return "Диалоги +2 дБ, большая комната, нейросеть и компрессор"
-        case .music: return "Широкая сцена, без акцента на центр"
-        case .speech: return "Подкасты, YouTube, аудиокниги: голос по центру, без комнаты, ровная громкость"
+        case .music: return "Широкая сцена, без акцента на центр и без компрессии"
+        case .speech: return "Подкасты, YouTube, аудиокниги: голос по центру и вперёд, ровная громкость"
         }
     }
 }
@@ -97,15 +97,29 @@ final class AppModel: ObservableObject {
     private var defaultDeviceListener: AudioObjectPropertyListenerBlock?
 
     init() {
-        refreshDevices()
+        refreshDevices(applyIfChanged: false)
 
-        settings.$enabled.sink { [weak self] _ in self?.apply() }.store(in: &bag)
+        // @Published fires on willSet: hop to the next main-queue turn so
+        // apply() reads the updated settings instead of the previous values.
+        settings.$enabled
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.apply() }
+            .store(in: &bag)
         settings.$profile.sink { [weak self] value in self?.engine.setProfile(value.rawValue) }.store(in: &bag)
         settings.$neural.sink { [weak self] value in self?.engine.setNeural(value) }.store(in: &bag)
         settings.$reverb.sink { [weak self] value in self?.engine.setReverb(value) }.store(in: &bag)
         settings.$bypass.sink { [weak self] value in self?.engine.setBypass(value) }.store(in: &bag)
-        settings.$deviceUID.sink { [weak self] _ in self?.apply() }.store(in: &bag)
-        settings.$kindOverrides.sink { [weak self] _ in self?.apply() }.store(in: &bag)
+        settings.$deviceUID
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.apply() }
+            .store(in: &bag)
+        settings.$kindOverrides
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.apply() }
+            .store(in: &bag)
 
         engine.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &bag)
         updater.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &bag)
@@ -133,13 +147,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func refreshDevices() {
+    func refreshDevices(applyIfChanged: Bool = true) {
         let found = AudioDevices.outputs()
-        if found != devices { devices = found }
+        let changed = found != devices
+        if changed { devices = found }
         updateCurrent()
+        if applyIfChanged && changed && settings.enabled {
+            apply()
+        }
     }
 
-    private func currentDevice() -> AudioOutput? {
+    func currentDevice() -> AudioOutput? {
         if let uid = settings.deviceUID, let match = devices.first(where: { $0.uid == uid }) {
             return match
         }
@@ -170,17 +188,12 @@ final class AppModel: ObservableObject {
             updateCurrent()
             return
         }
-        guard let device = currentDevice() else {
+        guard let output = currentDevice() else {
             errorText = "Не найдено устройство вывода звука."
             engine.stop()
             return
         }
-        guard let defaultID = AudioDevices.defaultOutput() else {
-            errorText = "Система не сообщает устройство вывода."
-            return
-        }
 
-        let output = devices.first { $0.id == defaultID } ?? device
         let wanted = kind(for: output)
         let neuralReady = settings.neural && models.modelInstalled
         currentOutputName = output.name
@@ -191,7 +204,7 @@ final class AppModel: ObservableObject {
             errorText = nil
         }
 
-        if engine.isRunning, engine.outputName == output.name {
+        if engine.isRunning, engine.matchesOutput(output) {
             engine.setProfile(settings.profile.rawValue)
             engine.setDeviceKind(wanted)
             engine.setNeural(neuralReady)

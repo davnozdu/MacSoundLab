@@ -34,6 +34,12 @@ void sl_set_device(SLRenderer* r, int device);
 void sl_set_neural(SLRenderer* r, int on);
 void sl_set_reverb(SLRenderer* r, int on);
 void sl_set_bypass(SLRenderer* r, int on);
+// Blocks until the neural separator is loaded (offline rendering). The live
+// path loads it in the background by itself. Returns 1 when ready.
+int sl_prepare_neural(SLRenderer* r);
+// Processing delay inside the renderer, in frames (grows by ~29 ms while the
+// neural separator is in use).
+int sl_latency_frames(SLRenderer* r);
 void sl_reset(SLRenderer* r);
 
 /* Directory holding libonnxruntime; models: vocals.onnx (and optional speech.onnx). */

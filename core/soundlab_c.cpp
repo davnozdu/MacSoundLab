@@ -50,6 +50,14 @@ void sl_set_bypass(SLRenderer* r, int on) {
     if (r != nullptr) r->renderer.set_bypass(on != 0);
 }
 
+int sl_prepare_neural(SLRenderer* r) {
+    return (r != nullptr && r->renderer.prepare_neural()) ? 1 : 0;
+}
+
+int sl_latency_frames(SLRenderer* r) {
+    return r == nullptr ? 0 : r->renderer.latency_frames();
+}
+
 void sl_reset(SLRenderer* r) {
     if (r != nullptr) r->renderer.reset();
 }
